@@ -1,10 +1,12 @@
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -190,7 +192,6 @@ impl SortOrder {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum AppMode {
-    Scanning,
     Browsing,
     Searching,
     SortMenu { index: usize },
@@ -199,7 +200,9 @@ enum AppMode {
 
 #[derive(Clone, Debug, Default)]
 struct ScanSummary {
-    discovered: usize,
+    found: usize,
+    measured: usize,
+    in_flight: usize,
     total_bytes: u64,
     current_path: Option<PathBuf>,
     elapsed: Duration,
@@ -208,6 +211,7 @@ struct ScanSummary {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum DeleteStatus {
     Ready,
+    Queued,
     Deleting,
     Deleted,
     Failed(String),
@@ -215,14 +219,26 @@ enum DeleteStatus {
 
 #[derive(Clone, Debug)]
 enum WorkerMessage {
-    ScanProgress {
-        discovered: usize,
-        total_bytes: u64,
+    ScanDiscovered {
+        found: usize,
+        in_flight: usize,
         current_path: PathBuf,
     },
+    ScanMeasured {
+        entry: TargetEntry,
+        measured: usize,
+        in_flight: usize,
+    },
+    ScanMeasurementFailed {
+        warning: String,
+        measured: usize,
+        in_flight: usize,
+        current_path: PathBuf,
+    },
+    ScanWarning {
+        warning: String,
+    },
     ScanComplete {
-        entries: Vec<TargetEntry>,
-        warnings: Vec<String>,
         elapsed: Duration,
     },
     DeleteProgress {
@@ -230,6 +246,9 @@ enum WorkerMessage {
         status: DeleteStatus,
     },
 }
+
+type MeasureTargetFn = Arc<dyn Fn(&Path, &Path, &Path) -> io::Result<TargetEntry> + Send + Sync>;
+type DeleteRunner = Arc<dyn Fn(PathBuf, TargetEntry, Sender<WorkerMessage>) + Send + Sync>;
 
 struct App {
     root: PathBuf,
@@ -241,8 +260,14 @@ struct App {
     sort_field: SortField,
     sort_order: SortOrder,
     mode: AppMode,
+    scan_in_progress: bool,
+    scan_cursor_moved: bool,
     scan_summary: ScanSummary,
     scan_warnings: Vec<String>,
+    delete_queue: VecDeque<PathBuf>,
+    active_deletes: usize,
+    delete_worker_limit: usize,
+    delete_runner: DeleteRunner,
     table_state: TableState,
     worker_tx: Sender<WorkerMessage>,
     worker_rx: Receiver<WorkerMessage>,
@@ -266,9 +291,15 @@ impl App {
             search_query: String::new(),
             sort_field: SortField::Size,
             sort_order: SortOrder::Desc,
-            mode: AppMode::Scanning,
+            mode: AppMode::Browsing,
+            scan_in_progress: false,
+            scan_cursor_moved: false,
             scan_summary: ScanSummary::default(),
             scan_warnings: Vec::new(),
+            delete_queue: VecDeque::new(),
+            active_deletes: 0,
+            delete_worker_limit: delete_worker_limit(),
+            delete_runner: Arc::new(delete_target),
             table_state: TableState::default(),
             worker_tx,
             worker_rx,
@@ -279,7 +310,11 @@ impl App {
     }
 
     fn start_scan(&mut self) {
-        self.mode = AppMode::Scanning;
+        if !self.can_start_scan() {
+            return;
+        }
+        self.scan_in_progress = true;
+        self.scan_cursor_moved = false;
         self.entries.clear();
         self.filtered_indices.clear();
         self.cursor = 0;
@@ -288,41 +323,66 @@ impl App {
 
         let root = self.root.clone();
         let tx = self.worker_tx.clone();
-        thread::spawn(move || scan_targets(root, tx));
+        thread::spawn(move || scan_targets(root, tx, scan_worker_limit()));
     }
 
     fn drain_worker_messages(&mut self) {
         while let Ok(message) = self.worker_rx.try_recv() {
             match message {
-                WorkerMessage::ScanProgress {
-                    discovered,
-                    total_bytes,
+                WorkerMessage::ScanDiscovered {
+                    found,
+                    in_flight,
                     current_path,
                 } => {
-                    self.scan_summary.discovered = discovered;
-                    self.scan_summary.total_bytes = total_bytes;
+                    self.scan_summary.found = found;
+                    self.scan_summary.in_flight = in_flight;
                     self.scan_summary.current_path = Some(current_path);
                 }
-                WorkerMessage::ScanComplete {
-                    entries,
-                    warnings,
-                    elapsed,
+                WorkerMessage::ScanMeasured {
+                    entry,
+                    measured,
+                    in_flight,
                 } => {
-                    self.entries = entries;
-                    self.scan_summary.discovered = self.entries.len();
-                    self.scan_summary.total_bytes =
-                        self.entries.iter().map(|entry| entry.size_bytes).sum();
+                    let focused_path = self.current_entry().map(|entry| entry.target_path.clone());
+                    self.scan_summary.current_path = Some(entry.target_path.clone());
+                    self.entries.push(entry);
+                    self.scan_summary.measured = measured;
+                    self.scan_summary.in_flight = in_flight;
+                    self.scan_summary.total_bytes = self.cached_total_bytes();
+                    self.recompute_view_with_focus(focused_path);
+                }
+                WorkerMessage::ScanMeasurementFailed {
+                    warning,
+                    measured,
+                    in_flight,
+                    current_path,
+                } => {
+                    self.scan_warnings.push(warning);
+                    self.scan_summary.measured = measured;
+                    self.scan_summary.in_flight = in_flight;
+                    self.scan_summary.current_path = Some(current_path);
+                }
+                WorkerMessage::ScanWarning { warning } => {
+                    self.scan_warnings.push(warning);
+                }
+                WorkerMessage::ScanComplete { elapsed } => {
+                    self.scan_in_progress = false;
                     self.scan_summary.current_path = None;
                     self.scan_summary.elapsed = elapsed;
-                    self.scan_warnings = warnings;
                     let known_paths: HashSet<_> = self
                         .entries
                         .iter()
                         .map(|entry| entry.target_path.clone())
                         .collect();
                     self.selected.retain(|path| known_paths.contains(path));
-                    self.recompute_view();
-                    self.mode = AppMode::Browsing;
+                    let focused_path = self
+                        .scan_cursor_moved
+                        .then(|| self.current_entry().map(|entry| entry.target_path.clone()))
+                        .flatten();
+                    if focused_path.is_none() {
+                        self.cursor = 0;
+                    }
+                    self.recompute_view_with_focus(focused_path);
                 }
                 WorkerMessage::DeleteProgress { path, status } => {
                     if let Some(entry) = self
@@ -337,6 +397,8 @@ impl App {
                         entry.delete_status = status;
                         self.scan_summary.total_bytes = self.cached_total_bytes();
                     }
+                    self.active_deletes = self.active_deletes.saturating_sub(1);
+                    self.start_queued_deletes();
                 }
             }
         }
@@ -349,11 +411,6 @@ impl App {
         }
 
         match self.mode.clone() {
-            AppMode::Scanning => {
-                if matches!(key.code, KeyCode::Char('q')) {
-                    self.should_quit = true;
-                }
-            }
             AppMode::Browsing => self.handle_browsing_key(key),
             AppMode::Searching => self.handle_search_key(key),
             AppMode::SortMenu { index } => self.handle_sort_menu_key(key, index),
@@ -371,12 +428,10 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => self.move_cursor(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_cursor(-1),
             KeyCode::Char('g') => {
-                self.cursor = 0;
-                self.sync_table_state();
+                self.set_cursor(0);
             }
             KeyCode::Char('G') => {
-                self.cursor = self.filtered_indices.len().saturating_sub(1);
-                self.sync_table_state();
+                self.set_cursor(self.filtered_indices.len().saturating_sub(1));
             }
             KeyCode::Char(' ') => self.toggle_current_selection(),
             KeyCode::Char('a') => self.toggle_all_filtered(),
@@ -390,6 +445,7 @@ impl App {
                 self.mode = AppMode::SortMenu { index };
             }
             KeyCode::Char('d') => self.start_delete_current(),
+            KeyCode::Char('D') => self.start_delete_selected(),
             KeyCode::Char('r') => self.start_scan(),
             KeyCode::Char('?') => self.mode = AppMode::Help,
             _ => {}
@@ -442,26 +498,19 @@ impl App {
     }
 
     fn start_delete_current(&mut self) {
-        let Some(entry) = self.current_entry().cloned() else {
+        let Some(path) = self.current_entry().map(|entry| entry.target_path.clone()) else {
             return;
         };
-        if matches!(
-            entry.delete_status,
-            DeleteStatus::Deleting | DeleteStatus::Deleted
-        ) {
-            return;
-        }
-        if let Some(cached_entry) = self
-            .entries
-            .iter_mut()
-            .find(|cached_entry| cached_entry.target_path == entry.target_path)
-        {
-            cached_entry.delete_status = DeleteStatus::Deleting;
-        }
+        self.enqueue_delete_paths([path]);
+    }
 
-        let root = self.root.clone();
-        let tx = self.worker_tx.clone();
-        thread::spawn(move || delete_target(root, entry, tx));
+    fn start_delete_selected(&mut self) {
+        let paths = self
+            .selected_entries()
+            .into_iter()
+            .map(|entry| entry.target_path.clone())
+            .collect::<Vec<_>>();
+        self.enqueue_delete_paths(paths);
     }
 
     fn apply_sort_field(&mut self, field: SortField) {
@@ -475,6 +524,11 @@ impl App {
     }
 
     fn recompute_view(&mut self) {
+        let focused_path = self.current_entry().map(|entry| entry.target_path.clone());
+        self.recompute_view_with_focus(focused_path);
+    }
+
+    fn recompute_view_with_focus(&mut self, focused_path: Option<PathBuf>) {
         self.entries
             .sort_by(|left, right| compare_entries(left, right, self.sort_field, self.sort_order));
         self.filtered_indices = self
@@ -485,24 +539,41 @@ impl App {
                 entry_matches_query(entry, &self.search_query).then_some(index)
             })
             .collect();
-        self.cursor = self
-            .cursor
-            .min(self.filtered_indices.len().saturating_sub(1));
+        self.cursor = focused_path
+            .as_ref()
+            .and_then(|path| {
+                self.filtered_indices.iter().position(|index| {
+                    self.entries
+                        .get(*index)
+                        .is_some_and(|entry| entry.target_path == *path)
+                })
+            })
+            .unwrap_or_else(|| {
+                self.cursor
+                    .min(self.filtered_indices.len().saturating_sub(1))
+            });
         self.sync_table_state();
     }
 
     fn move_cursor(&mut self, delta: isize) {
         if self.filtered_indices.is_empty() {
-            self.cursor = 0;
-            self.sync_table_state();
+            self.set_cursor(0);
             return;
         }
 
-        if delta.is_negative() {
-            self.cursor = self.cursor.saturating_sub(delta.unsigned_abs());
+        let cursor = if delta.is_negative() {
+            self.cursor.saturating_sub(delta.unsigned_abs())
         } else {
-            self.cursor = (self.cursor + delta as usize).min(self.filtered_indices.len() - 1);
+            (self.cursor + delta as usize).min(self.filtered_indices.len() - 1)
+        };
+        self.set_cursor(cursor);
+    }
+
+    fn set_cursor(&mut self, cursor: usize) {
+        if self.cursor != cursor && self.scan_in_progress {
+            self.scan_cursor_moved = true;
         }
+        self.cursor = cursor;
         self.sync_table_state();
     }
 
@@ -599,8 +670,58 @@ impl App {
         })
     }
 
+    fn can_start_scan(&self) -> bool {
+        !self.scan_in_progress && self.active_deletes == 0 && self.delete_queue.is_empty()
+    }
+
+    fn enqueue_delete_paths<I>(&mut self, paths: I)
+    where
+        I: IntoIterator<Item = PathBuf>,
+    {
+        for path in paths {
+            let Some(entry) = self
+                .entries
+                .iter_mut()
+                .find(|entry| entry.target_path == path)
+            else {
+                continue;
+            };
+            if !entry.is_selectable() {
+                continue;
+            }
+            entry.delete_status = DeleteStatus::Queued;
+            self.delete_queue.push_back(path);
+        }
+        self.start_queued_deletes();
+    }
+
+    fn start_queued_deletes(&mut self) {
+        while self.active_deletes < self.delete_worker_limit {
+            let Some(path) = self.delete_queue.pop_front() else {
+                return;
+            };
+            let Some(entry) = self
+                .entries
+                .iter_mut()
+                .find(|entry| entry.target_path == path)
+            else {
+                continue;
+            };
+            if !matches!(entry.delete_status, DeleteStatus::Queued) {
+                continue;
+            }
+            entry.delete_status = DeleteStatus::Deleting;
+            let entry = entry.clone();
+            self.active_deletes += 1;
+            let root = self.root.clone();
+            let tx = self.worker_tx.clone();
+            let delete_runner = Arc::clone(&self.delete_runner);
+            thread::spawn(move || delete_runner(root, entry, tx));
+        }
+    }
+
     fn needs_animation(&self) -> bool {
-        matches!(self.mode, AppMode::Scanning)
+        self.scan_in_progress
             || self
                 .entries
                 .iter()
@@ -666,17 +787,84 @@ impl TargetEntry {
     fn is_selectable(&self) -> bool {
         !matches!(
             self.delete_status,
-            DeleteStatus::Deleting | DeleteStatus::Deleted
+            DeleteStatus::Queued | DeleteStatus::Deleting | DeleteStatus::Deleted
         )
     }
 }
 
-fn scan_targets(root: PathBuf, tx: Sender<WorkerMessage>) {
+#[derive(Clone, Debug)]
+struct ScanJob {
+    project_root: PathBuf,
+    target_path: PathBuf,
+}
+
+fn scan_targets(root: PathBuf, tx: Sender<WorkerMessage>, worker_limit: usize) {
+    scan_targets_with(
+        root,
+        tx,
+        worker_limit,
+        Arc::new(measure_target as fn(&Path, &Path, &Path) -> io::Result<TargetEntry>),
+    );
+}
+
+fn scan_targets_with(
+    root: PathBuf,
+    tx: Sender<WorkerMessage>,
+    worker_limit: usize,
+    measure_target: MeasureTargetFn,
+) {
     let started = Instant::now();
-    let mut entries = Vec::new();
-    let mut warnings = Vec::new();
+    let worker_limit = worker_limit.max(1);
+    let (job_tx, job_rx) = mpsc::sync_channel::<ScanJob>(worker_limit.saturating_mul(2).max(1));
+    let job_rx = Arc::new(Mutex::new(job_rx));
+    let found = Arc::new(AtomicUsize::new(0));
+    let measured = Arc::new(AtomicUsize::new(0));
+    let mut workers = Vec::with_capacity(worker_limit);
+    for _ in 0..worker_limit {
+        let job_rx = Arc::clone(&job_rx);
+        let found = Arc::clone(&found);
+        let measured = Arc::clone(&measured);
+        let root = root.clone();
+        let tx = tx.clone();
+        let measure_target = Arc::clone(&measure_target);
+        workers.push(thread::spawn(move || {
+            loop {
+                let job = {
+                    let receiver = job_rx.lock().expect("scan job receiver poisoned");
+                    receiver.recv()
+                };
+                let Ok(job) = job else {
+                    return;
+                };
+
+                match measure_target(&job.project_root, &job.target_path, &root) {
+                    Ok(entry) => {
+                        let measured = measured.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+                        let in_flight =
+                            found.load(AtomicOrdering::Relaxed).saturating_sub(measured);
+                        let _ = tx.send(WorkerMessage::ScanMeasured {
+                            entry,
+                            measured,
+                            in_flight,
+                        });
+                    }
+                    Err(error) => {
+                        let measured = measured.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+                        let in_flight =
+                            found.load(AtomicOrdering::Relaxed).saturating_sub(measured);
+                        let _ = tx.send(WorkerMessage::ScanMeasurementFailed {
+                            warning: format!("{}: {error}", job.target_path.display()),
+                            measured,
+                            in_flight,
+                            current_path: job.target_path,
+                        });
+                    }
+                }
+            }
+        }));
+    }
+
     let mut seen_targets = HashSet::new();
-    let mut total_bytes = 0;
 
     for entry in WalkDir::new(&root)
         .follow_links(false)
@@ -695,7 +883,9 @@ fn scan_targets(root: PathBuf, tx: Sender<WorkerMessage>) {
                 let canonical_target = match fs::canonicalize(&target_path) {
                     Ok(path) => path,
                     Err(error) => {
-                        warnings.push(format!("{}: {error}", target_path.display()));
+                        let _ = tx.send(WorkerMessage::ScanWarning {
+                            warning: format!("{}: {error}", target_path.display()),
+                        });
                         continue;
                     }
                 };
@@ -703,27 +893,35 @@ fn scan_targets(root: PathBuf, tx: Sender<WorkerMessage>) {
                     continue;
                 }
 
-                match measure_target(project_root, &canonical_target, &root) {
-                    Ok(target_entry) => {
-                        total_bytes += target_entry.size_bytes;
-                        entries.push(target_entry);
-                        let _ = tx.send(WorkerMessage::ScanProgress {
-                            discovered: entries.len(),
-                            total_bytes,
-                            current_path: canonical_target,
-                        });
-                    }
-                    Err(error) => warnings.push(format!("{}: {error}", target_path.display())),
+                let job = ScanJob {
+                    project_root: project_root.to_path_buf(),
+                    target_path: canonical_target.clone(),
+                };
+                if job_tx.send(job).is_err() {
+                    break;
                 }
+                let found = found.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+                let in_flight = found.saturating_sub(measured.load(AtomicOrdering::Relaxed));
+                let _ = tx.send(WorkerMessage::ScanDiscovered {
+                    found,
+                    in_flight,
+                    current_path: canonical_target,
+                });
             }
             Ok(_) => {}
-            Err(error) => warnings.push(error.to_string()),
+            Err(error) => {
+                let _ = tx.send(WorkerMessage::ScanWarning {
+                    warning: error.to_string(),
+                });
+            }
         }
     }
 
+    drop(job_tx);
+    for worker in workers {
+        let _ = worker.join();
+    }
     let _ = tx.send(WorkerMessage::ScanComplete {
-        entries,
-        warnings,
         elapsed: started.elapsed(),
     });
 }
@@ -789,6 +987,21 @@ fn delete_target(root: PathBuf, entry: TargetEntry, tx: Sender<WorkerMessage>) {
     let _ = tx.send(WorkerMessage::DeleteProgress { path, status });
 }
 
+fn scan_worker_limit() -> usize {
+    auto_worker_limit(8)
+}
+
+fn delete_worker_limit() -> usize {
+    auto_worker_limit(4)
+}
+
+fn auto_worker_limit(maximum: usize) -> usize {
+    thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(4)
+        .clamp(1, maximum)
+}
+
 fn validate_delete_path(root: &Path, target_path: &Path) -> io::Result<()> {
     if target_path.file_name().and_then(|name| name.to_str()) != Some("target") {
         return Err(io::Error::new(
@@ -843,46 +1056,53 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
 }
 
 fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let status = match &app.mode {
-        AppMode::Scanning => format!(
-            "{}  Scanning {}",
+    let deleting_count = app
+        .entries
+        .iter()
+        .filter(|entry| matches!(entry.delete_status, DeleteStatus::Deleting))
+        .count();
+    let queued_count = app
+        .entries
+        .iter()
+        .filter(|entry| matches!(entry.delete_status, DeleteStatus::Queued))
+        .count();
+    let status = if app.scan_in_progress {
+        let mut status = format!(
+            "{} scanning {}/{} measured · {} active · {} so far",
             spinner(app.animation_tick),
-            app.scan_summary
-                .current_path
-                .as_ref()
-                .map(|path| display_relative_path(&app.root, path))
-                .unwrap_or_else(|| app.root.display().to_string())
-        ),
-        _ => {
-            let deleting_count = app
-                .entries
-                .iter()
-                .filter(|entry| matches!(entry.delete_status, DeleteStatus::Deleting))
-                .count();
-            if deleting_count > 0 {
-                format!(
-                    "{}  Deleting {} target folder{}",
-                    spinner(app.animation_tick),
-                    deleting_count,
-                    if deleting_count == 1 { "" } else { "s" }
-                )
-            } else if app.scan_warnings.is_empty() {
-                format!(
-                    "{} scanned · {} remaining · {}",
-                    app.entries.len(),
-                    app.remaining_target_count(),
-                    format_duration(app.scan_summary.elapsed)
-                )
-            } else {
-                format!(
-                    "{} scanned · {} remaining · {} warnings · {}",
-                    app.entries.len(),
-                    app.remaining_target_count(),
-                    app.scan_warnings.len(),
-                    format_duration(app.scan_summary.elapsed)
-                )
-            }
+            app.scan_summary.measured,
+            app.scan_summary.found,
+            app.scan_summary.in_flight,
+            format_bytes(app.scan_summary.total_bytes)
+        );
+        if deleting_count > 0 || queued_count > 0 {
+            status.push_str(&format!(
+                " · {deleting_count} deleting · {queued_count} queued"
+            ));
         }
+        status
+    } else if deleting_count > 0 || queued_count > 0 {
+        format!(
+            "{} deleting {} · {} queued",
+            spinner(app.animation_tick),
+            deleting_count,
+            queued_count
+        )
+    } else if app.scan_warnings.is_empty() {
+        format!(
+            "{} scanned · {} remaining · {}",
+            app.entries.len(),
+            app.remaining_target_count(),
+            format_duration(app.scan_summary.elapsed)
+        )
+    } else {
+        format!(
+            "{} scanned · {} remaining · {} warnings · {}",
+            app.entries.len(),
+            app.remaining_target_count(),
+            app.scan_warnings.len(),
+            format_duration(app.scan_summary.elapsed)
+        )
     };
     let status = truncate_end_text(&status, (area.width as usize / 2).max(12));
     let root = truncate_middle_text(
@@ -1027,7 +1247,7 @@ fn render_search(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn render_table_or_state(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
-    if matches!(app.mode, AppMode::Scanning) && app.entries.is_empty() {
+    if app.scan_in_progress && app.entries.is_empty() {
         render_scan_state(frame, area, app);
         return;
     }
@@ -1059,6 +1279,7 @@ fn render_table_or_state(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             };
             let status_suffix = match &entry.delete_status {
                 DeleteStatus::Ready => String::new(),
+                DeleteStatus::Queued => " queued".to_string(),
                 DeleteStatus::Deleting => " deleting…".to_string(),
                 DeleteStatus::Deleted => " deleted".to_string(),
                 DeleteStatus::Failed(error) => format!(" failed: {error}"),
@@ -1181,8 +1402,9 @@ fn render_scan_state(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Line::from(""),
         Line::from(Span::styled(
             format!(
-                "{} projects found · {} so far",
-                app.scan_summary.discovered,
+                "{} targets found · {} measured · {} so far",
+                app.scan_summary.found,
+                app.scan_summary.measured,
                 format_bytes(app.scan_summary.total_bytes)
             ),
             Style::default().fg(TEXT_SECONDARY),
@@ -1219,27 +1441,33 @@ fn render_empty_state(frame: &mut Frame<'_>, area: Rect) {
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let mut spans = match app.mode {
-        AppMode::Searching => {
-            footer_spans(&[("esc", "cancel"), ("enter", "apply"), ("type", "filter")])
-        }
+        AppMode::Searching => footer_spans(&[
+            ("esc", "cancel", true),
+            ("enter", "apply", true),
+            ("type", "filter", true),
+        ]),
         AppMode::SortMenu { .. } => footer_spans(&[
-            ("↑↓", "pick"),
-            ("enter", "apply"),
-            ("s", "toggle"),
-            ("esc", "close"),
+            ("↑↓", "pick", true),
+            ("enter", "apply", true),
+            ("s", "toggle", true),
+            ("esc", "close", true),
         ]),
-        _ => footer_spans(&[
-            ("↑↓", "navigate"),
-            ("space", "select"),
-            ("a", "all"),
-            ("i", "invert"),
-            ("/", "search"),
-            ("s", "sort"),
-            ("d", "delete focused"),
-            ("r", "rescan"),
-            ("?", "help"),
-            ("q", "quit"),
-        ]),
+        _ => {
+            let can_rescan = app.can_start_scan();
+            footer_spans(&[
+                ("↑↓", "navigate", true),
+                ("space", "select", true),
+                ("a", "all", true),
+                ("i", "invert", true),
+                ("/", "search", true),
+                ("s", "sort", true),
+                ("d", "delete focused", true),
+                ("D", "delete selected", true),
+                ("r", if can_rescan { "rescan" } else { "busy" }, can_rescan),
+                ("?", "help", true),
+                ("q", "quit", true),
+            ])
+        }
     };
     if let Some((count, bytes)) = app.cleaned_session_summary() {
         spans.push(Span::raw("    "));
@@ -1300,7 +1528,8 @@ fn render_help(frame: &mut Frame<'_>) {
         "/           Search",
         "s           Sort",
         "d           Delete focused row immediately",
-        "r           Rescan",
+        "D           Delete selected rows immediately",
+        "r           Rescan when idle",
         "?           Toggle help",
         "q / ctrl-c  Quit",
     ]
@@ -1315,18 +1544,20 @@ fn render_help(frame: &mut Frame<'_>) {
     );
 }
 
-fn footer_spans(pairs: &[(&str, &str)]) -> Vec<Span<'static>> {
+fn footer_spans(pairs: &[(&str, &str, bool)]) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
-    for (index, (key, action)) in pairs.iter().enumerate() {
+    for (index, (key, action, enabled)) in pairs.iter().enumerate() {
         if index > 0 {
             spans.push(Span::raw("  "));
         }
-        spans.push(Span::styled(
-            (*key).to_string(),
+        let key_style = if *enabled {
             Style::default()
                 .fg(ACCENT_PRIMARY)
-                .add_modifier(Modifier::BOLD),
-        ));
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(TEXT_MUTED)
+        };
+        spans.push(Span::styled((*key).to_string(), key_style));
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
             (*action).to_string(),
@@ -1406,6 +1637,12 @@ fn status_span(entry: &TargetEntry, is_selected: bool, animation_tick: usize) ->
                 .add_modifier(Modifier::BOLD),
         ),
         DeleteStatus::Ready => Span::raw(" "),
+        DeleteStatus::Queued => Span::styled(
+            "…".to_string(),
+            Style::default()
+                .fg(ACCENT_WARNING)
+                .add_modifier(Modifier::BOLD),
+        ),
         DeleteStatus::Deleting => Span::styled(
             spinner(animation_tick).to_string(),
             Style::default()
@@ -1663,7 +1900,8 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let mut app = App::new(temp.path().to_path_buf(), tx, rx);
         app.entries = entries;
-        app.scan_summary.discovered = app.entries.len();
+        app.scan_summary.found = app.entries.len();
+        app.scan_summary.measured = app.entries.len();
         app.scan_summary.total_bytes = app.cached_total_bytes();
         app.recompute_view();
         app.selected.insert(app.entries[1].target_path.clone());
@@ -1679,7 +1917,7 @@ mod tests {
         ));
         assert!(matches!(app.entries[1].delete_status, DeleteStatus::Ready));
         assert!(app.selected.contains(&app.entries[1].target_path));
-        assert_eq!(app.scan_summary.discovered, 2);
+        assert_eq!(app.scan_summary.found, 2);
         assert_eq!(app.scan_summary.total_bytes, 512);
         assert_eq!(app.selected_total_bytes(), 512);
     }
@@ -1695,7 +1933,8 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let mut app = App::new(temp.path().to_path_buf(), tx, rx);
         app.entries = vec![entry];
-        app.scan_summary.discovered = 1;
+        app.scan_summary.found = 1;
+        app.scan_summary.measured = 1;
         app.scan_summary.total_bytes = app.cached_total_bytes();
         app.recompute_view();
         app.start_delete_current();
@@ -1773,15 +2012,244 @@ mod tests {
         assert!(failed.contains("failed"));
     }
 
-    fn scan_sync(root: &Path) -> Vec<TargetEntry> {
+    #[test]
+    fn scan_measurements_stream_before_scan_completion() {
+        let temp = TestDir::new();
+        create_project(&temp.path().join("alpha"), 1024);
+        create_project(&temp.path().join("beta"), 2048);
+        let measure_target = Arc::new(
+            |project_root: &Path, target_path: &Path, scan_root: &Path| {
+                if project_root.file_name().and_then(|name| name.to_str()) == Some("alpha") {
+                    thread::sleep(Duration::from_millis(40));
+                }
+                measure_target(project_root, target_path, scan_root)
+            },
+        );
         let (tx, rx) = mpsc::channel();
-        scan_targets(root.to_path_buf(), tx);
-        rx.try_iter()
-            .find_map(|message| match message {
-                WorkerMessage::ScanComplete { entries, .. } => Some(entries),
+
+        scan_targets_with(temp.path().to_path_buf(), tx, 2, measure_target);
+
+        let messages = rx.try_iter().collect::<Vec<_>>();
+        let measured_names = messages
+            .iter()
+            .filter_map(|message| match message {
+                WorkerMessage::ScanMeasured { entry, .. } => Some(entry.display_name.as_str()),
                 _ => None,
             })
-            .unwrap()
+            .collect::<Vec<_>>();
+        assert_eq!(measured_names, vec!["beta", "alpha"]);
+        assert!(matches!(
+            messages.last(),
+            Some(WorkerMessage::ScanComplete { .. })
+        ));
+    }
+
+    #[test]
+    fn measured_scan_rows_are_interactive_before_scan_completion() {
+        let temp = TestDir::new();
+        let project = temp.path().join("alpha");
+        create_project(&project, 1024);
+        let entry = measure_target(&project, &project.join("target"), temp.path()).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let mut app = App::new(temp.path().to_path_buf(), tx, rx);
+        app.scan_in_progress = true;
+        app.worker_tx
+            .send(WorkerMessage::ScanMeasured {
+                entry,
+                measured: 1,
+                in_flight: 0,
+            })
+            .unwrap();
+
+        app.drain_worker_messages();
+        app.toggle_current_selection();
+        app.start_delete_current();
+        wait_for_delete(&mut app);
+
+        assert!(matches!(
+            app.entries[0].delete_status,
+            DeleteStatus::Deleted
+        ));
+    }
+
+    #[test]
+    fn scan_updates_preserve_focused_target_after_resort() {
+        let temp = TestDir::new();
+        let (tx, rx) = mpsc::channel();
+        let mut app = App::new(temp.path().to_path_buf(), tx, rx);
+        app.entries = vec![fake_entry("alpha", 10), fake_entry("beta", 20)];
+        app.recompute_view();
+        app.cursor = 1;
+        let focused_path = app.current_entry().unwrap().target_path.clone();
+        app.worker_tx
+            .send(WorkerMessage::ScanMeasured {
+                entry: fake_entry("gamma", 30),
+                measured: 3,
+                in_flight: 0,
+            })
+            .unwrap();
+
+        app.drain_worker_messages();
+
+        assert_eq!(app.current_entry().unwrap().target_path, focused_path);
+    }
+
+    #[test]
+    fn scan_completion_focuses_largest_row_without_user_navigation() {
+        let temp = TestDir::new();
+        let (tx, rx) = mpsc::channel();
+        let mut app = App::new(temp.path().to_path_buf(), tx, rx);
+        app.scan_in_progress = true;
+        app.worker_tx
+            .send(WorkerMessage::ScanMeasured {
+                entry: fake_entry("alpha", 10),
+                measured: 1,
+                in_flight: 1,
+            })
+            .unwrap();
+        app.worker_tx
+            .send(WorkerMessage::ScanMeasured {
+                entry: fake_entry("gamma", 30),
+                measured: 2,
+                in_flight: 0,
+            })
+            .unwrap();
+
+        app.drain_worker_messages();
+        assert_eq!(app.current_entry().unwrap().display_name, "alpha");
+
+        app.worker_tx
+            .send(WorkerMessage::ScanComplete {
+                elapsed: Duration::from_millis(5),
+            })
+            .unwrap();
+        app.drain_worker_messages();
+
+        assert_eq!(app.current_entry().unwrap().display_name, "gamma");
+    }
+
+    #[test]
+    fn scan_completion_preserves_user_navigation() {
+        let temp = TestDir::new();
+        let (tx, rx) = mpsc::channel();
+        let mut app = App::new(temp.path().to_path_buf(), tx, rx);
+        app.scan_in_progress = true;
+        for (measured, entry) in [
+            (1, fake_entry("alpha", 10)),
+            (2, fake_entry("gamma", 30)),
+            (3, fake_entry("beta", 20)),
+        ] {
+            app.worker_tx
+                .send(WorkerMessage::ScanMeasured {
+                    entry,
+                    measured,
+                    in_flight: 3 - measured,
+                })
+                .unwrap();
+        }
+
+        app.drain_worker_messages();
+        assert_eq!(app.current_entry().unwrap().display_name, "alpha");
+        app.move_cursor(-1);
+        assert_eq!(app.current_entry().unwrap().display_name, "beta");
+
+        app.worker_tx
+            .send(WorkerMessage::ScanComplete {
+                elapsed: Duration::from_millis(5),
+            })
+            .unwrap();
+        app.drain_worker_messages();
+
+        assert_eq!(app.current_entry().unwrap().display_name, "beta");
+    }
+
+    #[test]
+    fn rescan_is_ignored_while_scan_is_busy() {
+        let temp = TestDir::new();
+        let (tx, rx) = mpsc::channel();
+        let mut app = App::new(temp.path().to_path_buf(), tx, rx);
+        app.entries = vec![fake_entry("alpha", 10)];
+        app.recompute_view();
+        app.scan_in_progress = true;
+
+        app.handle_browsing_key(KeyEvent::from(KeyCode::Char('r')));
+
+        assert_eq!(app.entries.len(), 1);
+        assert!(app.scan_in_progress);
+    }
+
+    #[test]
+    fn selected_delete_uses_bounded_queue() {
+        let temp = TestDir::new();
+        let alpha = temp.path().join("alpha");
+        let beta = temp.path().join("beta");
+        create_project(&alpha, 1024);
+        create_project(&beta, 2048);
+        let entries = vec![
+            measure_target(&alpha, &alpha.join("target"), temp.path()).unwrap(),
+            measure_target(&beta, &beta.join("target"), temp.path()).unwrap(),
+        ];
+        let (worker_tx, worker_rx) = mpsc::channel();
+        let mut app = App::new(temp.path().to_path_buf(), worker_tx, worker_rx);
+        app.entries = entries;
+        app.recompute_view();
+        app.delete_worker_limit = 1;
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        app.delete_runner = Arc::new(move |_root, entry, tx| {
+            started_tx.send(entry.target_path.clone()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+            tx.send(WorkerMessage::DeleteProgress {
+                path: entry.target_path,
+                status: DeleteStatus::Deleted,
+            })
+            .unwrap();
+        });
+        for entry in &app.entries {
+            app.selected.insert(entry.target_path.clone());
+        }
+
+        app.start_delete_selected();
+
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(
+            app.entries
+                .iter()
+                .filter(|entry| matches!(entry.delete_status, DeleteStatus::Deleting))
+                .count(),
+            1
+        );
+        assert_eq!(
+            app.entries
+                .iter()
+                .filter(|entry| matches!(entry.delete_status, DeleteStatus::Queued))
+                .count(),
+            1
+        );
+
+        release_tx.send(()).unwrap();
+        wait_for_delete_count(&mut app, 1);
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        release_tx.send(()).unwrap();
+        wait_for_delete_count(&mut app, 2);
+
+        assert!(
+            app.entries
+                .iter()
+                .all(|entry| matches!(entry.delete_status, DeleteStatus::Deleted))
+        );
+    }
+
+    fn scan_sync(root: &Path) -> Vec<TargetEntry> {
+        let (tx, rx) = mpsc::channel();
+        scan_targets(root.to_path_buf(), tx, 2);
+        rx.try_iter()
+            .filter_map(|message| match message {
+                WorkerMessage::ScanMeasured { entry, .. } => Some(entry),
+                _ => None,
+            })
+            .collect()
     }
 
     fn create_project(project: &Path, bytes: usize) {
@@ -1821,6 +2289,23 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         panic!("delete did not finish");
+    }
+
+    fn wait_for_delete_count(app: &mut App, count: usize) {
+        for _ in 0..50 {
+            app.drain_worker_messages();
+            if app
+                .entries
+                .iter()
+                .filter(|entry| matches!(entry.delete_status, DeleteStatus::Deleted))
+                .count()
+                >= count
+            {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("expected {count} deletes to finish");
     }
 
     struct TestDir {
