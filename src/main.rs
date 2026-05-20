@@ -25,9 +25,11 @@ const SURFACE: Color = Color::Rgb(30, 30, 40);
 const TEXT_PRIMARY: Color = Color::Rgb(234, 234, 242);
 const TEXT_SECONDARY: Color = Color::Rgb(177, 177, 192);
 const TEXT_MUTED: Color = Color::Rgb(122, 122, 137);
+const BORDER: Color = Color::Rgb(50, 50, 65);
 const ACCENT_PRIMARY: Color = Color::Rgb(110, 168, 254);
 const ACCENT_SUCCESS: Color = Color::Rgb(116, 198, 157);
 const ACCENT_WARNING: Color = Color::Rgb(255, 183, 77);
+const ACCENT_ERROR: Color = Color::Rgb(255, 107, 107);
 
 fn main() -> io::Result<()> {
     let root = parse_root_argument()?;
@@ -129,6 +131,7 @@ struct TargetEntry {
     display_name: String,
     relative_path: String,
     size_bytes: u64,
+    original_size_bytes: u64,
     modified_at: SystemTime,
     delete_status: DeleteStatus,
 }
@@ -573,6 +576,27 @@ impl App {
             .sum()
     }
 
+    fn remaining_target_count(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|entry| !matches!(entry.delete_status, DeleteStatus::Deleted))
+            .count()
+    }
+
+    fn cleaned_session_summary(&self) -> Option<(usize, u64)> {
+        let deleted: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|entry| matches!(entry.delete_status, DeleteStatus::Deleted))
+            .collect();
+        (!deleted.is_empty()).then(|| {
+            (
+                deleted.len(),
+                deleted.iter().map(|entry| entry.original_size_bytes).sum(),
+            )
+        })
+    }
+
     fn needs_animation(&self) -> bool {
         matches!(self.mode, AppMode::Scanning)
             || self
@@ -748,6 +772,7 @@ fn measure_target(
             .to_string(),
         relative_path: display_relative_path(scan_root, target_path),
         size_bytes,
+        original_size_bytes: size_bytes,
         modified_at,
         delete_status: DeleteStatus::Ready,
     })
@@ -789,13 +814,27 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     );
     let outer = Block::default()
         .borders(Borders::ALL)
-        .title(format!(
-            " purgee  {}  scanned {} in {} ",
-            app.root.display(),
-            app.scan_summary.discovered,
-            format_duration(app.scan_summary.elapsed)
-        ))
-        .style(Style::default().fg(TEXT_PRIMARY).bg(BG));
+        .title(Line::from(vec![
+            Span::styled(
+                " purgee ",
+                Style::default()
+                    .fg(TEXT_PRIMARY)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                app.root.display().to_string(),
+                Style::default().fg(TEXT_SECONDARY),
+            ),
+            Span::styled(
+                format!(
+                    "  scanned {} in {} ",
+                    app.scan_summary.discovered,
+                    format_duration(app.scan_summary.elapsed)
+                ),
+                Style::default().fg(TEXT_MUTED),
+            ),
+        ]))
+        .style(Style::default().fg(BORDER).bg(BG));
     let area = outer.inner(frame.area());
     frame.render_widget(outer, frame.area());
 
@@ -848,11 +887,16 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
                     if deleting_count == 1 { "" } else { "s" }
                 )
             } else if app.scan_warnings.is_empty() {
-                format!("{} targets discovered", app.entries.len())
+                format!(
+                    "{} scanned · {} remaining",
+                    app.entries.len(),
+                    app.remaining_target_count()
+                )
             } else {
                 format!(
-                    "{} targets discovered  ·  {} scan warnings",
+                    "{} scanned · {} remaining · {} scan warnings",
                     app.entries.len(),
+                    app.remaining_target_count(),
                     app.scan_warnings.len()
                 )
             }
@@ -879,7 +923,7 @@ fn render_stats(frame: &mut Frame<'_>, area: Rect, app: &App) {
         chunks[0],
         "Reclaimable",
         format_bytes(app.scan_summary.total_bytes),
-        format!("across {} targets", app.entries.len()),
+        format!("across {} remaining", app.remaining_target_count()),
         TEXT_PRIMARY,
     );
     render_stat_card(
@@ -909,7 +953,7 @@ fn render_stats(frame: &mut Frame<'_>, area: Rect, app: &App) {
         chunks[2],
         "Largest",
         largest,
-        "current scan".to_string(),
+        "largest remaining target".to_string(),
         TEXT_PRIMARY,
     );
 }
@@ -925,7 +969,7 @@ fn render_stat_card(
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
-        .style(Style::default().fg(TEXT_SECONDARY).bg(SURFACE));
+        .style(Style::default().fg(BORDER).bg(SURFACE));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let content = vec![
@@ -949,7 +993,7 @@ fn render_search(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let border_color = if matches!(app.mode, AppMode::Searching) {
         ACCENT_PRIMARY
     } else {
-        TEXT_MUTED
+        BORDER
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -960,7 +1004,11 @@ fn render_search(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let cursor = matches!(app.mode, AppMode::Searching)
         .then_some("█")
         .unwrap_or("");
-    let left = format!("Search › {}{}", app.search_query, cursor);
+    let left = if app.search_query.is_empty() && !matches!(app.mode, AppMode::Searching) {
+        "Search ›  type to filter…".to_string()
+    } else {
+        format!("Search › {}{}", app.search_query, cursor)
+    };
     let right = format!(
         "Sort: {} {}",
         app.sort_field.label(),
@@ -969,10 +1017,12 @@ fn render_search(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let width = inner.width as usize;
     let spaces = width.saturating_sub(left.chars().count() + right.chars().count());
     let line = format!("{left}{}{right}", " ".repeat(spaces.max(1)));
-    frame.render_widget(
-        Paragraph::new(line).style(Style::default().fg(TEXT_PRIMARY).bg(BG)),
-        inner,
-    );
+    let search_style = if app.search_query.is_empty() && !matches!(app.mode, AppMode::Searching) {
+        Style::default().fg(TEXT_MUTED).bg(BG)
+    } else {
+        Style::default().fg(TEXT_PRIMARY).bg(BG)
+    };
+    frame.render_widget(Paragraph::new(line).style(search_style), inner);
 }
 
 fn render_table_or_state(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
@@ -994,23 +1044,11 @@ fn render_table_or_state(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             let entry = &app.entries[*entry_index];
             let is_selected = app.selected.contains(&entry.target_path);
             let is_active = visible_index == app.cursor;
-            let marker = if is_active { "▸" } else { " " };
-            let checkbox = match entry.delete_status {
-                DeleteStatus::Ready => {
-                    if is_selected {
-                        "✓"
-                    } else {
-                        " "
-                    }
-                }
-                DeleteStatus::Deleting => spinner(app.animation_tick),
-                DeleteStatus::Deleted => "✓",
-                DeleteStatus::Failed(_) => "!",
-            };
-            let row_style = if is_active {
-                Style::default().bg(Color::Rgb(39, 54, 79)).fg(TEXT_PRIMARY)
-            } else {
-                Style::default().bg(BG).fg(TEXT_PRIMARY)
+            let row_style = match entry.delete_status {
+                DeleteStatus::Deleted => Style::default().bg(BG).fg(TEXT_MUTED),
+                DeleteStatus::Failed(_) => Style::default().bg(BG).fg(ACCENT_ERROR),
+                _ if is_active => Style::default().bg(Color::Rgb(39, 54, 79)).fg(TEXT_PRIMARY),
+                _ => Style::default().bg(BG).fg(TEXT_PRIMARY),
             };
             let size_style = if entry.effective_size_bytes() >= 1024 * 1024 * 1024 {
                 row_style.fg(ACCENT_WARNING)
@@ -1024,14 +1062,24 @@ fn render_table_or_state(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 DeleteStatus::Failed(error) => format!(" failed: {error}"),
             };
             Row::new(vec![
-                Cell::from(format!("{marker} {checkbox}")),
+                Cell::from(Line::from(vec![
+                    Span::styled(
+                        if is_active { "▸" } else { " " },
+                        Style::default().fg(ACCENT_PRIMARY),
+                    ),
+                    Span::raw(" "),
+                    status_span(entry, is_selected, app.animation_tick),
+                ])),
                 Cell::from(highlight_text(
                     &format!("{}{}", entry.display_name, status_suffix),
                     &app.search_query,
                 )),
-                Cell::from(format_bytes(entry.effective_size_bytes())).style(size_style),
+                Cell::from(format_size_cell(entry.effective_size_bytes())).style(size_style),
                 Cell::from(relative_time(entry.modified_at)),
-                Cell::from(highlight_text(&entry.relative_path, &app.search_query)),
+                Cell::from(highlight_text(
+                    &compact_relative_path(&entry.relative_path),
+                    &app.search_query,
+                )),
             ])
             .style(row_style)
         })
@@ -1054,8 +1102,7 @@ fn render_table_or_state(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .title(format!(" {} visible ", app.filtered_indices.len()))
-            .style(Style::default().fg(TEXT_SECONDARY).bg(BG)),
+            .style(Style::default().fg(BORDER).bg(BG)),
     )
     .column_spacing(1);
     app.sync_table_state();
@@ -1096,7 +1143,7 @@ fn render_scan_state(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Paragraph::new(lines).alignment(Alignment::Center).block(
             Block::default()
                 .borders(Borders::ALL)
-                .style(Style::default().fg(TEXT_SECONDARY)),
+                .style(Style::default().fg(BORDER)),
         ),
         area,
     );
@@ -1121,22 +1168,45 @@ fn render_empty_state(frame: &mut Frame<'_>, area: Rect) {
         Paragraph::new(lines).alignment(Alignment::Center).block(
             Block::default()
                 .borders(Borders::ALL)
-                .style(Style::default().fg(TEXT_SECONDARY)),
+                .style(Style::default().fg(BORDER)),
         ),
         area,
     );
 }
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let text = match app.mode {
-        AppMode::Searching => "esc cancel   enter apply   type to filter",
-        AppMode::SortMenu { .. } => "↑↓ pick   enter apply   s toggle direction   esc close",
-        _ => {
-            "↑↓ navigate   space select   a all   i invert   / search   s sort   d delete focused   r rescan   ? help   q quit"
+    let mut spans = match app.mode {
+        AppMode::Searching => {
+            footer_spans(&[("esc", "cancel"), ("enter", "apply"), ("type", "filter")])
         }
+        AppMode::SortMenu { .. } => footer_spans(&[
+            ("↑↓", "pick"),
+            ("enter", "apply"),
+            ("s", "toggle"),
+            ("esc", "close"),
+        ]),
+        _ => footer_spans(&[
+            ("↑↓", "navigate"),
+            ("space", "select"),
+            ("a", "all"),
+            ("i", "invert"),
+            ("/", "search"),
+            ("s", "sort"),
+            ("d", "delete focused"),
+            ("r", "rescan"),
+            ("?", "help"),
+            ("q", "quit"),
+        ]),
     };
+    if let Some((count, bytes)) = app.cleaned_session_summary() {
+        spans.push(Span::raw("    "));
+        spans.push(Span::styled(
+            format!("{count} cleaned · {} freed", format_bytes(bytes)),
+            Style::default().fg(TEXT_MUTED),
+        ));
+    }
     frame.render_widget(
-        Paragraph::new(text).style(Style::default().fg(TEXT_MUTED).bg(BG)),
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(BG)),
         area,
     );
 }
@@ -1202,6 +1272,55 @@ fn render_help(frame: &mut Frame<'_>) {
     );
 }
 
+fn footer_spans(pairs: &[(&str, &str)]) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for (index, (key, action)) in pairs.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(
+            (*key).to_string(),
+            Style::default()
+                .fg(ACCENT_PRIMARY)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            (*action).to_string(),
+            Style::default().fg(TEXT_MUTED),
+        ));
+    }
+    spans
+}
+
+fn status_span(entry: &TargetEntry, is_selected: bool, animation_tick: usize) -> Span<'static> {
+    match entry.delete_status {
+        DeleteStatus::Ready if is_selected => Span::styled(
+            "✓".to_string(),
+            Style::default()
+                .fg(ACCENT_SUCCESS)
+                .add_modifier(Modifier::BOLD),
+        ),
+        DeleteStatus::Ready => Span::raw(" "),
+        DeleteStatus::Deleting => Span::styled(
+            spinner(animation_tick).to_string(),
+            Style::default()
+                .fg(ACCENT_PRIMARY)
+                .add_modifier(Modifier::BOLD),
+        ),
+        DeleteStatus::Deleted => Span::styled(
+            "✓".to_string(),
+            Style::default().fg(TEXT_MUTED).add_modifier(Modifier::BOLD),
+        ),
+        DeleteStatus::Failed(_) => Span::styled(
+            "!".to_string(),
+            Style::default()
+                .fg(ACCENT_ERROR)
+                .add_modifier(Modifier::BOLD),
+        ),
+    }
+}
+
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
@@ -1248,6 +1367,32 @@ fn display_relative_path(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
         .map(|relative| format!("./{}", relative.display()))
         .unwrap_or_else(|_| path.display().to_string())
+}
+
+fn compact_relative_path(path: &str) -> String {
+    const MAX_CHARS: usize = 28;
+    if path.chars().count() <= MAX_CHARS {
+        return path.to_string();
+    }
+
+    let trimmed = path.trim_start_matches("./").trim_end_matches("/target");
+    let tail = trimmed
+        .rsplit('/')
+        .take(2)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("/");
+    format!("…/{tail}/target")
+}
+
+fn format_size_cell(bytes: u64) -> String {
+    let formatted = format_bytes(bytes);
+    let mut parts = formatted.split_whitespace();
+    let value = parts.next().unwrap_or("0");
+    let unit = parts.next().unwrap_or("B");
+    format!("{value:>6} {unit:<2}")
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -1515,6 +1660,7 @@ mod tests {
             display_name: name.to_string(),
             relative_path: format!("./{name}/target"),
             size_bytes,
+            original_size_bytes: size_bytes,
             modified_at: UNIX_EPOCH,
             delete_status: DeleteStatus::Ready,
         }
