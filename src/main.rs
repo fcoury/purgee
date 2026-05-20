@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::{self, Stdout};
@@ -16,7 +16,9 @@ use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Cell, Clear, Padding, Paragraph, Row, Table, TableState, Wrap,
+};
 use ratatui::{Frame, Terminal};
 use walkdir::{DirEntry, WalkDir};
 
@@ -812,48 +814,26 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
         Block::default().style(Style::default().bg(BG)),
         frame.area(),
     );
-    let outer = Block::default()
-        .borders(Borders::ALL)
-        .title(Line::from(vec![
-            Span::styled(
-                " purgee ",
-                Style::default()
-                    .fg(TEXT_PRIMARY)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                app.root.display().to_string(),
-                Style::default().fg(TEXT_SECONDARY),
-            ),
-            Span::styled(
-                format!(
-                    "  scanned {} in {} ",
-                    app.scan_summary.discovered,
-                    format_duration(app.scan_summary.elapsed)
-                ),
-                Style::default().fg(TEXT_MUTED),
-            ),
-        ]))
-        .style(Style::default().fg(BORDER).bg(BG));
-    let area = outer.inner(frame.area());
-    frame.render_widget(outer, frame.area());
+    let area = inset_rect(frame.area(), 2, 1);
 
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
-            Constraint::Length(5),
-            Constraint::Length(3),
+            Constraint::Length(1),
+            Constraint::Length(4),
+            Constraint::Length(1),
+            Constraint::Length(1),
             Constraint::Min(8),
             Constraint::Length(1),
         ])
         .split(area);
 
     render_header(frame, layout[0], app);
-    render_stats(frame, layout[1], app);
-    render_search(frame, layout[2], app);
-    render_table_or_state(frame, layout[3], app);
-    render_footer(frame, layout[4], app);
+    render_stats(frame, layout[2], app);
+    render_search(frame, layout[4], app);
+    render_table_or_state(frame, layout[5], app);
+    render_footer(frame, layout[6], app);
 
     match app.mode {
         AppMode::SortMenu { index } => render_sort_menu(frame, app, index),
@@ -888,24 +868,42 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 )
             } else if app.scan_warnings.is_empty() {
                 format!(
-                    "{} scanned · {} remaining",
+                    "{} scanned · {} remaining · {}",
                     app.entries.len(),
-                    app.remaining_target_count()
+                    app.remaining_target_count(),
+                    format_duration(app.scan_summary.elapsed)
                 )
             } else {
                 format!(
-                    "{} scanned · {} remaining · {} scan warnings",
+                    "{} scanned · {} remaining · {} warnings · {}",
                     app.entries.len(),
                     app.remaining_target_count(),
-                    app.scan_warnings.len()
+                    app.scan_warnings.len(),
+                    format_duration(app.scan_summary.elapsed)
                 )
             }
         }
     };
-    frame.render_widget(
-        Paragraph::new(status).style(Style::default().fg(TEXT_SECONDARY).bg(BG)),
-        area,
+    let status = truncate_end_text(&status, (area.width as usize / 2).max(12));
+    let root = truncate_middle_text(
+        &app.root.display().to_string(),
+        (area.width as usize)
+            .saturating_sub(status.chars().count())
+            .saturating_sub("purgee   ".chars().count())
+            .max(8),
     );
+    let left = Line::from(vec![
+        Span::styled(
+            "purgee",
+            Style::default()
+                .fg(TEXT_PRIMARY)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(root, Style::default().fg(TEXT_SECONDARY)),
+    ]);
+    let right = Line::from(Span::styled(status, Style::default().fg(TEXT_MUTED)));
+    render_spaced_line(frame, area, left, right);
 }
 
 fn render_stats(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -967,12 +965,15 @@ fn render_stat_card(
     value_color: Color,
 ) {
     let block = Block::default()
-        .borders(Borders::ALL)
-        .title(title)
-        .style(Style::default().fg(BORDER).bg(SURFACE));
+        .style(Style::default().bg(SURFACE))
+        .padding(Padding::new(1, 1, 1, 1));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let content = vec![
+        Line::from(Span::styled(
+            title.to_uppercase(),
+            Style::default().fg(TEXT_MUTED).add_modifier(Modifier::BOLD),
+        )),
         Line::from(Span::styled(
             value,
             Style::default()
@@ -990,17 +991,6 @@ fn render_stat_card(
 }
 
 fn render_search(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let border_color = if matches!(app.mode, AppMode::Searching) {
-        ACCENT_PRIMARY
-    } else {
-        BORDER
-    };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .style(Style::default().fg(border_color).bg(BG));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
     let cursor = matches!(app.mode, AppMode::Searching)
         .then_some("█")
         .unwrap_or("");
@@ -1014,15 +1004,26 @@ fn render_search(frame: &mut Frame<'_>, area: Rect, app: &App) {
         app.sort_field.label(),
         app.sort_order.symbol()
     );
-    let width = inner.width as usize;
-    let spaces = width.saturating_sub(left.chars().count() + right.chars().count());
-    let line = format!("{left}{}{right}", " ".repeat(spaces.max(1)));
+    let left = truncate_end_text(
+        &left,
+        (area.width as usize)
+            .saturating_sub(right.chars().count())
+            .saturating_sub(3)
+            .max(8),
+    );
     let search_style = if app.search_query.is_empty() && !matches!(app.mode, AppMode::Searching) {
         Style::default().fg(TEXT_MUTED).bg(BG)
     } else {
         Style::default().fg(TEXT_PRIMARY).bg(BG)
     };
-    frame.render_widget(Paragraph::new(line).style(search_style), inner);
+    let prefix = if matches!(app.mode, AppMode::Searching) {
+        Span::styled("▎ ", Style::default().fg(ACCENT_PRIMARY))
+    } else {
+        Span::raw("  ")
+    };
+    let left = Line::from(vec![prefix, Span::styled(left, search_style)]);
+    let right = Line::from(Span::styled(right, Style::default().fg(TEXT_SECONDARY)));
+    render_spaced_line(frame, area, left, right);
 }
 
 fn render_table_or_state(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
@@ -1036,6 +1037,7 @@ fn render_table_or_state(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         return;
     }
 
+    let duplicate_names = duplicate_display_names(&app.entries);
     let rows: Vec<_> = app
         .filtered_indices
         .iter()
@@ -1071,7 +1073,11 @@ fn render_table_or_state(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                     status_span(entry, is_selected, app.animation_tick),
                 ])),
                 Cell::from(highlight_text(
-                    &format!("{}{}", entry.display_name, status_suffix),
+                    &format!(
+                        "{}{}",
+                        display_label(entry, &duplicate_names),
+                        status_suffix
+                    ),
                     &app.search_query,
                 )),
                 Cell::from(format_size_cell(entry.effective_size_bytes())).style(size_style),
@@ -1085,28 +1091,79 @@ fn render_table_or_state(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         })
         .collect();
 
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(4),
-            Constraint::Percentage(28),
-            Constraint::Length(12),
-            Constraint::Length(14),
-            Constraint::Min(18),
+    let widths = [
+        Constraint::Length(4),
+        Constraint::Percentage(28),
+        Constraint::Length(12),
+        Constraint::Length(14),
+        Constraint::Min(18),
+    ];
+    let has_session_summary = app.cleaned_session_summary().is_some();
+    let mut constraints = vec![
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(1),
+    ];
+    if has_session_summary {
+        constraints.push(Constraint::Length(1));
+    }
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(area);
+    let header = Table::new(
+        vec![
+            Row::new(vec!["", "PROJECT", "SIZE", "MODIFIED", "TARGET"])
+                .style(Style::default().fg(TEXT_MUTED).add_modifier(Modifier::BOLD)),
         ],
-    )
-    .header(
-        Row::new(vec!["", "PROJECT", "SIZE", "MODIFIED", "TARGET"])
-            .style(Style::default().fg(TEXT_MUTED).add_modifier(Modifier::BOLD)),
-    )
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .style(Style::default().fg(BORDER).bg(BG)),
+        widths,
     )
     .column_spacing(1);
+    frame.render_widget(header, sections[0]);
+    render_rule(frame, sections[1]);
+
+    let table = Table::new(rows, widths).column_spacing(1);
     app.sync_table_state();
-    frame.render_stateful_widget(table, area, &mut app.table_state);
+    frame.render_stateful_widget(table, sections[2], &mut app.table_state);
+    if has_session_summary {
+        render_rule(frame, sections[3]);
+    }
+}
+
+fn duplicate_display_names(entries: &[TargetEntry]) -> HashSet<&str> {
+    let mut counts = HashMap::new();
+    for entry in entries {
+        *counts.entry(entry.display_name.as_str()).or_insert(0_usize) += 1;
+    }
+    counts
+        .into_iter()
+        .filter_map(|(name, count)| (count > 1).then_some(name))
+        .collect()
+}
+
+fn display_label(entry: &TargetEntry, duplicate_names: &HashSet<&str>) -> String {
+    if !duplicate_names.contains(entry.display_name.as_str()) {
+        return entry.display_name.clone();
+    }
+
+    let qualifier = entry
+        .project_root
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .map(short_worktree_qualifier)
+        .filter(|qualifier| !qualifier.is_empty());
+    match qualifier {
+        Some(qualifier) => format!("{} · {qualifier}", entry.display_name),
+        None => entry.display_name.clone(),
+    }
+}
+
+fn short_worktree_qualifier(name: &str) -> String {
+    name.strip_prefix("codex.fcoury-")
+        .or_else(|| name.strip_prefix("codex-"))
+        .unwrap_or(name)
+        .to_string()
 }
 
 fn render_scan_state(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -1139,14 +1196,7 @@ fn render_scan_state(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Style::default().fg(TEXT_MUTED),
         )),
     ];
-    frame.render_widget(
-        Paragraph::new(lines).alignment(Alignment::Center).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .style(Style::default().fg(BORDER)),
-        ),
-        area,
-    );
+    frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), area);
 }
 
 fn render_empty_state(frame: &mut Frame<'_>, area: Rect) {
@@ -1164,14 +1214,7 @@ fn render_empty_state(frame: &mut Frame<'_>, area: Rect) {
             Style::default().fg(TEXT_SECONDARY),
         )),
     ];
-    frame.render_widget(
-        Paragraph::new(lines).alignment(Alignment::Center).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .style(Style::default().fg(BORDER)),
-        ),
-        area,
-    );
+    frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), area);
 }
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -1291,6 +1334,67 @@ fn footer_spans(pairs: &[(&str, &str)]) -> Vec<Span<'static>> {
         ));
     }
     spans
+}
+
+fn render_spaced_line(frame: &mut Frame<'_>, area: Rect, left: Line<'_>, right: Line<'_>) {
+    let spaces = (area.width as usize)
+        .saturating_sub(left.width() + right.width())
+        .max(1);
+    let mut spans = left.spans;
+    spans.push(Span::raw(" ".repeat(spaces)));
+    spans.extend(right.spans);
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn render_rule(frame: &mut Frame<'_>, area: Rect) {
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            "─".repeat(area.width as usize),
+            Style::default().fg(BORDER),
+        )),
+        area,
+    );
+}
+
+fn inset_rect(area: Rect, horizontal: u16, vertical: u16) -> Rect {
+    Rect::new(
+        area.x.saturating_add(horizontal),
+        area.y.saturating_add(vertical),
+        area.width.saturating_sub(horizontal.saturating_mul(2)),
+        area.height.saturating_sub(vertical.saturating_mul(2)),
+    )
+}
+
+fn truncate_end_text(text: &str, max_width: usize) -> String {
+    if text.chars().count() <= max_width {
+        return text.to_string();
+    }
+    if max_width <= 1 {
+        return "…".to_string();
+    }
+    let keep = max_width - 1;
+    format!("{}…", text.chars().take(keep).collect::<String>())
+}
+
+fn truncate_middle_text(text: &str, max_width: usize) -> String {
+    if text.chars().count() <= max_width {
+        return text.to_string();
+    }
+    if max_width <= 1 {
+        return "…".to_string();
+    }
+    let keep = max_width - 1;
+    let start = keep.div_ceil(2);
+    let end = keep / 2;
+    let suffix = text
+        .chars()
+        .rev()
+        .take(end)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    format!("{}…{suffix}", text.chars().take(start).collect::<String>())
 }
 
 fn status_span(entry: &TargetEntry, is_selected: bool, animation_tick: usize) -> Span<'static> {
@@ -1481,6 +1585,43 @@ mod tests {
         assert_eq!(entry.size_bytes, 3072);
         assert_eq!(entry.display_name, "alpha");
         assert_eq!(entry.relative_path, "./alpha/target");
+    }
+
+    #[test]
+    fn duplicate_project_names_show_parent_worktree_qualifier() {
+        let entries = vec![
+            TargetEntry {
+                project_root: PathBuf::from("/tmp/codex.fcoury-suggest-next/codex-rs"),
+                target_path: PathBuf::from("/tmp/codex.fcoury-suggest-next/codex-rs/target"),
+                display_name: "codex-rs".to_string(),
+                relative_path: "./codex.fcoury-suggest-next/codex-rs/target".to_string(),
+                size_bytes: 10,
+                original_size_bytes: 10,
+                modified_at: UNIX_EPOCH,
+                delete_status: DeleteStatus::Ready,
+            },
+            TargetEntry {
+                project_root: PathBuf::from("/tmp/codex.fcoury-startup-suggest/codex-rs"),
+                target_path: PathBuf::from("/tmp/codex.fcoury-startup-suggest/codex-rs/target"),
+                display_name: "codex-rs".to_string(),
+                relative_path: "./codex.fcoury-startup-suggest/codex-rs/target".to_string(),
+                size_bytes: 20,
+                original_size_bytes: 20,
+                modified_at: UNIX_EPOCH,
+                delete_status: DeleteStatus::Ready,
+            },
+        ];
+
+        let duplicates = duplicate_display_names(&entries);
+
+        assert_eq!(
+            display_label(&entries[0], &duplicates),
+            "codex-rs · suggest-next"
+        );
+        assert_eq!(
+            display_label(&entries[1], &duplicates),
+            "codex-rs · startup-suggest"
+        );
     }
 
     #[test]
