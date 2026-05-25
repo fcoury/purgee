@@ -2,6 +2,15 @@
 name = "purgee"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+description = "Terminal UI for finding and removing Rust target directories"
+license = "MIT"
+repository = "https://github.com/fcoury/purgee"
+homepage = "https://github.com/fcoury/purgee"
+readme = "README.md"
+categories = ["command-line-utilities", "development-tools"]
+keywords = ["tui", "cargo", "cleanup", "disk"]
+include = ["src/**", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE"]
 
 [dependencies]
 crossterm = "0.28.1"

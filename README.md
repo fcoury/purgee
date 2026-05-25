@@ -16,6 +16,20 @@ and removing selected `target/` directories quickly.
 
 ## Install
 
+With Cargo:
+
+```sh
+cargo install purgee
+```
+
+With Homebrew:
+
+```sh
+brew install fcoury/tap/purgee
+```
+
+From a local checkout:
+
 ```sh
 cargo install --path .
 ```

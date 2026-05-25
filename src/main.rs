@@ -37,10 +37,36 @@ const ACCENT_WARNING: Color = Color::Rgb(255, 183, 77);
 const ACCENT_ERROR: Color = Color::Rgb(255, 107, 107);
 
 fn main() -> io::Result<()> {
-    let options = parse_arguments()?;
-    let mut terminal = TerminalSession::new()?;
-    run_app(terminal.terminal_mut(), options)
+    match parse_cli()? {
+        CliAction::Run(options) => {
+            let mut terminal = TerminalSession::new()?;
+            run_app(terminal.terminal_mut(), options)
+        }
+        CliAction::PrintHelp => {
+            println!("{}", HELP_TEXT);
+            Ok(())
+        }
+        CliAction::PrintVersion => {
+            println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+    }
 }
+
+const USAGE: &str = "usage: purgee [PATH] | purgee targets [PATH] | purgee contents [PATH]";
+const HELP_TEXT: &str = concat!(
+    "purgee ",
+    env!("CARGO_PKG_VERSION"),
+    "\n\n",
+    "Terminal UI for finding and removing Rust target directories.\n\n",
+    "Usage:\n",
+    "  purgee [PATH]\n",
+    "  purgee targets [PATH]\n",
+    "  purgee contents [PATH]\n\n",
+    "Options:\n",
+    "  -h, --help       Print help\n",
+    "  -V, --version    Print version\n"
+);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ScanMode {
@@ -70,8 +96,34 @@ struct LaunchOptions {
     scan_mode: ScanMode,
 }
 
-fn parse_arguments() -> io::Result<LaunchOptions> {
-    parse_arguments_from(env::args_os().skip(1))
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CliAction {
+    Run(LaunchOptions),
+    PrintHelp,
+    PrintVersion,
+}
+
+fn parse_cli() -> io::Result<CliAction> {
+    parse_cli_from(env::args_os().skip(1))
+}
+
+fn parse_cli_from(mut args: impl Iterator<Item = OsString>) -> io::Result<CliAction> {
+    let first = args.next();
+    match first.as_deref().and_then(|argument| argument.to_str()) {
+        Some("-h" | "--help") => {
+            if args.next().is_some() {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, USAGE));
+            }
+            Ok(CliAction::PrintHelp)
+        }
+        Some("-V" | "--version") => {
+            if args.next().is_some() {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, USAGE));
+            }
+            Ok(CliAction::PrintVersion)
+        }
+        _ => parse_arguments_from(first.into_iter().chain(args)).map(CliAction::Run),
+    }
 }
 
 fn parse_arguments_from(mut args: impl Iterator<Item = OsString>) -> io::Result<LaunchOptions> {
@@ -85,10 +137,7 @@ fn parse_arguments_from(mut args: impl Iterator<Item = OsString>) -> io::Result<
         _ => (ScanMode::Targets, first.unwrap_or_else(|| ".".into())),
     };
     if args.next().is_some() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "usage: purgee [PATH] | purgee targets [PATH] | purgee contents [PATH]",
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, USAGE));
     }
 
     Ok(LaunchOptions {
@@ -2129,6 +2178,36 @@ mod tests {
         assert_eq!(default_mode.scan_mode, ScanMode::Targets);
         assert_eq!(contents_mode.scan_mode, ScanMode::Contents);
         assert_eq!(default_mode.root, contents_mode.root);
+    }
+
+    #[test]
+    fn cli_help_and_version_are_non_interactive_actions() {
+        assert_eq!(
+            parse_cli_from([OsString::from("--help")].into_iter()).unwrap(),
+            CliAction::PrintHelp
+        );
+        assert_eq!(
+            parse_cli_from([OsString::from("-h")].into_iter()).unwrap(),
+            CliAction::PrintHelp
+        );
+        assert_eq!(
+            parse_cli_from([OsString::from("--version")].into_iter()).unwrap(),
+            CliAction::PrintVersion
+        );
+        assert_eq!(
+            parse_cli_from([OsString::from("-V")].into_iter()).unwrap(),
+            CliAction::PrintVersion
+        );
+    }
+
+    #[test]
+    fn cli_help_and_version_reject_extra_arguments() {
+        assert!(
+            parse_cli_from([OsString::from("--help"), OsString::from(".")].into_iter()).is_err()
+        );
+        assert!(
+            parse_cli_from([OsString::from("--version"), OsString::from(".")].into_iter()).is_err()
+        );
     }
 
     #[test]
