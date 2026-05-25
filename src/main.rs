@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
@@ -36,22 +37,64 @@ const ACCENT_WARNING: Color = Color::Rgb(255, 183, 77);
 const ACCENT_ERROR: Color = Color::Rgb(255, 107, 107);
 
 fn main() -> io::Result<()> {
-    let root = parse_root_argument()?;
+    let options = parse_arguments()?;
     let mut terminal = TerminalSession::new()?;
-    run_app(terminal.terminal_mut(), root)
+    run_app(terminal.terminal_mut(), options)
 }
 
-fn parse_root_argument() -> io::Result<PathBuf> {
-    let mut args = env::args_os().skip(1);
-    let root = args.next().unwrap_or_else(|| ".".into());
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScanMode {
+    Targets,
+    Contents,
+}
+
+impl ScanMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Targets => "targets",
+            Self::Contents => "contents",
+        }
+    }
+
+    fn item_label(self) -> &'static str {
+        match self {
+            Self::Targets => "targets",
+            Self::Contents => "items",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LaunchOptions {
+    root: PathBuf,
+    scan_mode: ScanMode,
+}
+
+fn parse_arguments() -> io::Result<LaunchOptions> {
+    parse_arguments_from(env::args_os().skip(1))
+}
+
+fn parse_arguments_from(mut args: impl Iterator<Item = OsString>) -> io::Result<LaunchOptions> {
+    let first = args.next();
+    let (scan_mode, root) = match first.as_deref().and_then(|argument| argument.to_str()) {
+        Some("targets") => (ScanMode::Targets, args.next().unwrap_or_else(|| ".".into())),
+        Some("contents") => (
+            ScanMode::Contents,
+            args.next().unwrap_or_else(|| ".".into()),
+        ),
+        _ => (ScanMode::Targets, first.unwrap_or_else(|| ".".into())),
+    };
     if args.next().is_some() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "usage: purgee [PATH]",
+            "usage: purgee [PATH] | purgee targets [PATH] | purgee contents [PATH]",
         ));
     }
 
-    fs::canonicalize(root)
+    Ok(LaunchOptions {
+        root: fs::canonicalize(root)?,
+        scan_mode,
+    })
 }
 
 struct TerminalSession {
@@ -97,9 +140,9 @@ impl Drop for TerminalSession {
     }
 }
 
-fn run_app<B: Backend>(terminal: &mut Terminal<B>, root: PathBuf) -> io::Result<()> {
+fn run_app<B: Backend>(terminal: &mut Terminal<B>, options: LaunchOptions) -> io::Result<()> {
     let (worker_tx, worker_rx) = mpsc::channel();
-    let mut app = App::new(root, worker_tx, worker_rx);
+    let mut app = App::new(options.root, options.scan_mode, worker_tx, worker_rx);
     app.start_scan();
 
     loop {
@@ -195,6 +238,7 @@ enum AppMode {
     Browsing,
     Searching,
     SortMenu { index: usize },
+    ConfirmDelete { paths: Vec<PathBuf>, key: char },
     Help,
 }
 
@@ -252,6 +296,7 @@ type DeleteRunner = Arc<dyn Fn(PathBuf, TargetEntry, Sender<WorkerMessage>) + Se
 
 struct App {
     root: PathBuf,
+    scan_mode: ScanMode,
     entries: Vec<TargetEntry>,
     filtered_indices: Vec<usize>,
     cursor: usize,
@@ -279,11 +324,15 @@ struct App {
 impl App {
     fn new(
         root: PathBuf,
+        scan_mode: ScanMode,
         worker_tx: Sender<WorkerMessage>,
         worker_rx: Receiver<WorkerMessage>,
     ) -> Self {
+        let delete_runner: DeleteRunner =
+            Arc::new(move |root, entry, tx| delete_entry(scan_mode, root, entry, tx));
         Self {
             root,
+            scan_mode,
             entries: Vec::new(),
             filtered_indices: Vec::new(),
             cursor: 0,
@@ -299,7 +348,7 @@ impl App {
             delete_queue: VecDeque::new(),
             active_deletes: 0,
             delete_worker_limit: delete_worker_limit(),
-            delete_runner: Arc::new(delete_target),
+            delete_runner,
             table_state: TableState::default(),
             worker_tx,
             worker_rx,
@@ -322,8 +371,12 @@ impl App {
         self.scan_warnings.clear();
 
         let root = self.root.clone();
+        let scan_mode = self.scan_mode;
         let tx = self.worker_tx.clone();
-        thread::spawn(move || scan_targets(root, tx, scan_worker_limit()));
+        thread::spawn(move || match scan_mode {
+            ScanMode::Targets => scan_targets(root, tx, scan_worker_limit()),
+            ScanMode::Contents => scan_contents(root, tx, scan_worker_limit()),
+        });
     }
 
     fn drain_worker_messages(&mut self) {
@@ -414,6 +467,12 @@ impl App {
             AppMode::Browsing => self.handle_browsing_key(key),
             AppMode::Searching => self.handle_search_key(key),
             AppMode::SortMenu { index } => self.handle_sort_menu_key(key, index),
+            AppMode::ConfirmDelete {
+                paths,
+                key: confirm_key,
+            } => {
+                self.handle_confirm_delete_key(key, paths, confirm_key);
+            }
             AppMode::Help => {
                 if matches!(key.code, KeyCode::Esc | KeyCode::Char('?')) {
                     self.mode = AppMode::Browsing;
@@ -444,8 +503,8 @@ impl App {
                     .unwrap_or(0);
                 self.mode = AppMode::SortMenu { index };
             }
-            KeyCode::Char('d') => self.start_delete_current(),
-            KeyCode::Char('D') => self.start_delete_selected(),
+            KeyCode::Char('d') => self.request_delete_current(),
+            KeyCode::Char('D') => self.request_delete_selected(),
             KeyCode::Char('r') => self.start_scan(),
             KeyCode::Char('?') => self.mode = AppMode::Help,
             _ => {}
@@ -497,20 +556,41 @@ impl App {
         }
     }
 
-    fn start_delete_current(&mut self) {
+    fn request_delete_current(&mut self) {
         let Some(path) = self.current_entry().map(|entry| entry.target_path.clone()) else {
             return;
         };
-        self.enqueue_delete_paths([path]);
+        self.request_delete_paths(vec![path], 'd');
     }
 
-    fn start_delete_selected(&mut self) {
+    fn request_delete_selected(&mut self) {
         let paths = self
             .selected_entries()
             .into_iter()
             .map(|entry| entry.target_path.clone())
             .collect::<Vec<_>>();
-        self.enqueue_delete_paths(paths);
+        self.request_delete_paths(paths, 'D');
+    }
+
+    fn request_delete_paths(&mut self, paths: Vec<PathBuf>, key: char) {
+        if paths.is_empty() {
+            return;
+        }
+        match self.scan_mode {
+            ScanMode::Targets => self.enqueue_delete_paths(paths),
+            ScanMode::Contents => self.mode = AppMode::ConfirmDelete { paths, key },
+        }
+    }
+
+    fn handle_confirm_delete_key(&mut self, event: KeyEvent, paths: Vec<PathBuf>, key: char) {
+        match event.code {
+            KeyCode::Esc => self.mode = AppMode::Browsing,
+            KeyCode::Char(pressed) if pressed == key => {
+                self.mode = AppMode::Browsing;
+                self.enqueue_delete_paths(paths);
+            }
+            _ => {}
+        }
     }
 
     fn apply_sort_field(&mut self, field: SortField) {
@@ -588,6 +668,7 @@ impl App {
         if !self.selected.insert(path.clone()) {
             self.selected.remove(&path);
         }
+        self.move_cursor(1);
     }
 
     fn toggle_all_filtered(&mut self) {
@@ -813,6 +894,107 @@ fn scan_targets_with(
     worker_limit: usize,
     measure_target: MeasureTargetFn,
 ) {
+    scan_entries_with(
+        root,
+        tx,
+        worker_limit,
+        measure_target,
+        |root, tx, queue_job| {
+            let mut seen_targets = HashSet::new();
+            for entry in WalkDir::new(root)
+                .follow_links(false)
+                .into_iter()
+                .filter_entry(|entry| should_descend(entry, root))
+            {
+                match entry {
+                    Ok(entry)
+                        if entry.file_type().is_file() && entry.file_name() == "Cargo.toml" =>
+                    {
+                        let Some(project_root) = entry.path().parent() else {
+                            continue;
+                        };
+                        let target_path = project_root.join("target");
+                        if !is_real_directory(&target_path) {
+                            continue;
+                        }
+                        let canonical_target = match fs::canonicalize(&target_path) {
+                            Ok(path) => path,
+                            Err(error) => {
+                                let _ = tx.send(WorkerMessage::ScanWarning {
+                                    warning: format!("{}: {error}", target_path.display()),
+                                });
+                                continue;
+                            }
+                        };
+                        if !seen_targets.insert(canonical_target.clone()) {
+                            continue;
+                        }
+
+                        if !queue_job(ScanJob {
+                            project_root: project_root.to_path_buf(),
+                            target_path: canonical_target,
+                        }) {
+                            return;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        let _ = tx.send(WorkerMessage::ScanWarning {
+                            warning: error.to_string(),
+                        });
+                    }
+                }
+            }
+        },
+    );
+}
+
+fn scan_contents(root: PathBuf, tx: Sender<WorkerMessage>, worker_limit: usize) {
+    scan_entries_with(
+        root,
+        tx,
+        worker_limit,
+        Arc::new(measure_content as fn(&Path, &Path, &Path) -> io::Result<TargetEntry>),
+        |root, tx, queue_job| {
+            let entries = match fs::read_dir(root) {
+                Ok(entries) => entries,
+                Err(error) => {
+                    let _ = tx.send(WorkerMessage::ScanWarning {
+                        warning: format!("{}: {error}", root.display()),
+                    });
+                    return;
+                }
+            };
+            for entry in entries {
+                match entry {
+                    Ok(entry) => {
+                        if !queue_job(ScanJob {
+                            project_root: root.to_path_buf(),
+                            target_path: entry.path(),
+                        }) {
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = tx.send(WorkerMessage::ScanWarning {
+                            warning: error.to_string(),
+                        });
+                    }
+                }
+            }
+        },
+    );
+}
+
+fn scan_entries_with<F>(
+    root: PathBuf,
+    tx: Sender<WorkerMessage>,
+    worker_limit: usize,
+    measure_entry: MeasureTargetFn,
+    discover_jobs: F,
+) where
+    F: FnOnce(&Path, &Sender<WorkerMessage>, &mut dyn FnMut(ScanJob) -> bool),
+{
     let started = Instant::now();
     let worker_limit = worker_limit.max(1);
     let (job_tx, job_rx) = mpsc::sync_channel::<ScanJob>(worker_limit.saturating_mul(2).max(1));
@@ -826,7 +1008,7 @@ fn scan_targets_with(
         let measured = Arc::clone(&measured);
         let root = root.clone();
         let tx = tx.clone();
-        let measure_target = Arc::clone(&measure_target);
+        let measure_entry = Arc::clone(&measure_entry);
         workers.push(thread::spawn(move || {
             loop {
                 let job = {
@@ -837,7 +1019,7 @@ fn scan_targets_with(
                     return;
                 };
 
-                match measure_target(&job.project_root, &job.target_path, &root) {
+                match measure_entry(&job.project_root, &job.target_path, &root) {
                     Ok(entry) => {
                         let measured = measured.fetch_add(1, AtomicOrdering::Relaxed) + 1;
                         let in_flight =
@@ -864,58 +1046,21 @@ fn scan_targets_with(
         }));
     }
 
-    let mut seen_targets = HashSet::new();
-
-    for entry in WalkDir::new(&root)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(|entry| should_descend(entry, &root))
-    {
-        match entry {
-            Ok(entry) if entry.file_type().is_file() && entry.file_name() == "Cargo.toml" => {
-                let Some(project_root) = entry.path().parent() else {
-                    continue;
-                };
-                let target_path = project_root.join("target");
-                if !is_real_directory(&target_path) {
-                    continue;
-                }
-                let canonical_target = match fs::canonicalize(&target_path) {
-                    Ok(path) => path,
-                    Err(error) => {
-                        let _ = tx.send(WorkerMessage::ScanWarning {
-                            warning: format!("{}: {error}", target_path.display()),
-                        });
-                        continue;
-                    }
-                };
-                if !seen_targets.insert(canonical_target.clone()) {
-                    continue;
-                }
-
-                let job = ScanJob {
-                    project_root: project_root.to_path_buf(),
-                    target_path: canonical_target.clone(),
-                };
-                if job_tx.send(job).is_err() {
-                    break;
-                }
-                let found = found.fetch_add(1, AtomicOrdering::Relaxed) + 1;
-                let in_flight = found.saturating_sub(measured.load(AtomicOrdering::Relaxed));
-                let _ = tx.send(WorkerMessage::ScanDiscovered {
-                    found,
-                    in_flight,
-                    current_path: canonical_target,
-                });
-            }
-            Ok(_) => {}
-            Err(error) => {
-                let _ = tx.send(WorkerMessage::ScanWarning {
-                    warning: error.to_string(),
-                });
-            }
+    let mut queue_job = |job: ScanJob| {
+        let current_path = job.target_path.clone();
+        if job_tx.send(job).is_err() {
+            return false;
         }
-    }
+        let found = found.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+        let in_flight = found.saturating_sub(measured.load(AtomicOrdering::Relaxed));
+        let _ = tx.send(WorkerMessage::ScanDiscovered {
+            found,
+            in_flight,
+            current_path,
+        });
+        true
+    };
+    discover_jobs(&root, &tx, &mut queue_job);
 
     drop(job_tx);
     for worker in workers {
@@ -978,9 +1123,51 @@ fn measure_target(
     })
 }
 
-fn delete_target(root: PathBuf, entry: TargetEntry, tx: Sender<WorkerMessage>) {
+fn measure_content(
+    _parent_root: &Path,
+    item_path: &Path,
+    scan_root: &Path,
+) -> io::Result<TargetEntry> {
+    let item_metadata = fs::symlink_metadata(item_path)?;
+    let mut size_bytes = 0;
+    let mut modified_at = item_metadata.modified().unwrap_or(UNIX_EPOCH);
+
+    if item_metadata.file_type().is_dir() {
+        for entry in WalkDir::new(item_path).follow_links(false) {
+            let entry = entry.map_err(io::Error::other)?;
+            let metadata = fs::symlink_metadata(entry.path())?;
+            if metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+                size_bytes += metadata.len();
+            }
+            if let Ok(modified) = metadata.modified() {
+                modified_at = modified_at.max(modified);
+            }
+        }
+    } else {
+        size_bytes = item_metadata.len();
+    }
+
+    Ok(TargetEntry {
+        project_root: scan_root.to_path_buf(),
+        target_path: item_path.to_path_buf(),
+        display_name: item_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(".")
+            .to_string(),
+        relative_path: display_relative_path(scan_root, item_path),
+        size_bytes,
+        original_size_bytes: size_bytes,
+        modified_at,
+        delete_status: DeleteStatus::Ready,
+    })
+}
+
+fn delete_entry(scan_mode: ScanMode, root: PathBuf, entry: TargetEntry, tx: Sender<WorkerMessage>) {
     let path = entry.target_path.clone();
-    let status = match validate_delete_path(&root, &path).and_then(|()| fs::remove_dir_all(&path)) {
+    let status = match validate_delete_path(scan_mode, &root, &path)
+        .and_then(|()| remove_entry_path(&path))
+    {
         Ok(()) => DeleteStatus::Deleted,
         Err(error) => DeleteStatus::Failed(error.to_string()),
     };
@@ -1002,24 +1189,50 @@ fn auto_worker_limit(maximum: usize) -> usize {
         .clamp(1, maximum)
 }
 
-fn validate_delete_path(root: &Path, target_path: &Path) -> io::Result<()> {
-    if target_path.file_name().and_then(|name| name.to_str()) != Some("target") {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "refusing to delete a non-target directory",
-        ));
-    }
-
+fn validate_delete_path(scan_mode: ScanMode, root: &Path, target_path: &Path) -> io::Result<()> {
     let canonical_root = fs::canonicalize(root)?;
-    let canonical_target = fs::canonicalize(target_path)?;
-    if !canonical_target.starts_with(&canonical_root) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "refusing to delete a target outside the scan root",
-        ));
+    match scan_mode {
+        ScanMode::Targets => {
+            if target_path.file_name().and_then(|name| name.to_str()) != Some("target") {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "refusing to delete a non-target directory",
+                ));
+            }
+            let canonical_target = fs::canonicalize(target_path)?;
+            if !canonical_target.starts_with(&canonical_root) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "refusing to delete a target outside the scan root",
+                ));
+            }
+        }
+        ScanMode::Contents => {
+            let Some(parent) = target_path.parent() else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "refusing to delete an item without a parent directory",
+                ));
+            };
+            if target_path.file_name().is_none() || fs::canonicalize(parent)? != canonical_root {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "refusing to delete an item outside the viewed directory",
+                ));
+            }
+        }
     }
 
     Ok(())
+}
+
+fn remove_entry_path(path: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    }
 }
 
 fn render(frame: &mut Frame<'_>, app: &mut App) {
@@ -1050,7 +1263,10 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
 
     match app.mode {
         AppMode::SortMenu { index } => render_sort_menu(frame, app, index),
-        AppMode::Help => render_help(frame),
+        AppMode::ConfirmDelete { ref paths, key } => {
+            render_delete_confirmation(frame, app, paths, key);
+        }
+        AppMode::Help => render_help(frame, app),
         _ => {}
     }
 }
@@ -1105,11 +1321,14 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
         )
     };
     let status = truncate_end_text(&status, (area.width as usize / 2).max(12));
+    let prefix_width = format!("purgee  {}  ", app.scan_mode.label())
+        .chars()
+        .count();
     let root = truncate_middle_text(
         &app.root.display().to_string(),
         (area.width as usize)
             .saturating_sub(status.chars().count())
-            .saturating_sub("purgee   ".chars().count())
+            .saturating_sub(prefix_width)
             .max(8),
     );
     let left = Line::from(vec![
@@ -1119,6 +1338,8 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 .fg(TEXT_PRIMARY)
                 .add_modifier(Modifier::BOLD),
         ),
+        Span::raw("  "),
+        Span::styled(app.scan_mode.label(), Style::default().fg(ACCENT_PRIMARY)),
         Span::raw("  "),
         Span::styled(root, Style::default().fg(TEXT_SECONDARY)),
     ]);
@@ -1136,10 +1357,14 @@ fn render_stats(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ])
         .split(area);
 
+    let total_title = match app.scan_mode {
+        ScanMode::Targets => "Reclaimable",
+        ScanMode::Contents => "Measured",
+    };
     render_stat_card(
         frame,
         chunks[0],
-        "Reclaimable",
+        total_title,
         format_bytes(app.scan_summary.total_bytes),
         format!("across {} remaining", app.remaining_target_count()),
         TEXT_PRIMARY,
@@ -1149,7 +1374,14 @@ fn render_stats(frame: &mut Frame<'_>, area: Rect, app: &App) {
         chunks[1],
         "Selected",
         format_bytes(app.selected_total_bytes()),
-        format!("in {} projects", app.selected_entries().len()),
+        format!(
+            "in {} {}",
+            app.selected_entries().len(),
+            match app.scan_mode {
+                ScanMode::Targets => "projects",
+                ScanMode::Contents => "items",
+            }
+        ),
         ACCENT_WARNING,
     );
 
@@ -1165,13 +1397,19 @@ fn render_stats(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 format_bytes(entry.effective_size_bytes())
             )
         })
-        .unwrap_or_else(|| "No target folders".to_string());
+        .unwrap_or_else(|| match app.scan_mode {
+            ScanMode::Targets => "No target folders".to_string(),
+            ScanMode::Contents => "No items".to_string(),
+        });
     render_stat_card(
         frame,
         chunks[2],
         "Largest",
         largest,
-        "largest remaining target".to_string(),
+        match app.scan_mode {
+            ScanMode::Targets => "largest remaining target".to_string(),
+            ScanMode::Contents => "largest remaining item".to_string(),
+        },
         TEXT_PRIMARY,
     );
 }
@@ -1253,7 +1491,7 @@ fn render_table_or_state(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     }
 
     if app.entries.is_empty() {
-        render_empty_state(frame, area);
+        render_empty_state(frame, area, app);
         return;
     }
 
@@ -1304,7 +1542,7 @@ fn render_table_or_state(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 Cell::from(format_size_cell(entry.effective_size_bytes())).style(size_style),
                 Cell::from(relative_time(entry.modified_at)),
                 Cell::from(highlight_text(
-                    &compact_relative_path(&entry.relative_path),
+                    &compact_relative_path(&entry.relative_path, app.scan_mode),
                     &app.search_query,
                 )),
             ])
@@ -1332,9 +1570,13 @@ fn render_table_or_state(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         .direction(Direction::Vertical)
         .constraints(constraints)
         .split(area);
+    let (name_header, path_header) = match app.scan_mode {
+        ScanMode::Targets => ("PROJECT", "TARGET"),
+        ScanMode::Contents => ("ITEM", "PATH"),
+    };
     let header = Table::new(
         vec![
-            Row::new(vec!["", "PROJECT", "SIZE", "MODIFIED", "TARGET"])
+            Row::new(vec!["", name_header, "SIZE", "MODIFIED", path_header])
                 .style(Style::default().fg(TEXT_MUTED).add_modifier(Modifier::BOLD)),
         ],
         widths,
@@ -1402,8 +1644,9 @@ fn render_scan_state(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Line::from(""),
         Line::from(Span::styled(
             format!(
-                "{} targets found · {} measured · {} so far",
+                "{} {} found · {} measured · {} so far",
                 app.scan_summary.found,
+                app.scan_mode.item_label(),
                 app.scan_summary.measured,
                 format_bytes(app.scan_summary.total_bytes)
             ),
@@ -1421,20 +1664,24 @@ fn render_scan_state(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), area);
 }
 
-fn render_empty_state(frame: &mut Frame<'_>, area: Rect) {
+fn render_empty_state(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let (title, detail) = match app.scan_mode {
+        ScanMode::Targets => (
+            "No reclaimable target/ found",
+            "The current directory is already clean.",
+        ),
+        ScanMode::Contents => ("No items found", "The viewed directory is empty."),
+    };
     let lines = vec![
         Line::from(Span::styled("✓", Style::default().fg(ACCENT_SUCCESS))),
         Line::from(""),
         Line::from(Span::styled(
-            "No reclaimable target/ found",
+            title,
             Style::default()
                 .fg(TEXT_PRIMARY)
                 .add_modifier(Modifier::BOLD),
         )),
-        Line::from(Span::styled(
-            "The current directory is already clean.",
-            Style::default().fg(TEXT_SECONDARY),
-        )),
+        Line::from(Span::styled(detail, Style::default().fg(TEXT_SECONDARY))),
     ];
     frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), area);
 }
@@ -1451,6 +1698,10 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
             ("enter", "apply", true),
             ("s", "toggle", true),
             ("esc", "close", true),
+        ]),
+        AppMode::ConfirmDelete { key, .. } => footer_spans(&[
+            (key_label(key), "confirm delete", true),
+            ("esc", "cancel", true),
         ]),
         _ => {
             let can_rescan = app.can_start_scan();
@@ -1516,9 +1767,66 @@ fn render_sort_menu(frame: &mut Frame<'_>, app: &App, index: usize) {
     );
 }
 
-fn render_help(frame: &mut Frame<'_>) {
+fn render_delete_confirmation(frame: &mut Frame<'_>, app: &App, paths: &[PathBuf], key: char) {
+    let total_bytes = paths
+        .iter()
+        .filter_map(|path| {
+            app.entries
+                .iter()
+                .find(|entry| &entry.target_path == path)
+                .map(TargetEntry::effective_size_bytes)
+        })
+        .sum();
+    let subject = if paths.len() == 1 {
+        display_relative_path(&app.root, &paths[0])
+    } else {
+        format!("{} selected items", paths.len())
+    };
+    let area = centered_rect(64, 26, frame.area());
+    frame.render_widget(Clear, area);
+    let lines = vec![
+        Line::from(Span::styled(
+            format!(
+                "Delete {subject} ({}) recursively?",
+                format_bytes(total_bytes)
+            ),
+            Style::default()
+                .fg(TEXT_PRIMARY)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!(
+                "Press {} again to delete, or esc to cancel.",
+                key_label(key)
+            ),
+            Style::default().fg(ACCENT_WARNING),
+        )),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Confirm Delete "),
+            )
+            .style(Style::default().fg(TEXT_PRIMARY).bg(SURFACE))
+            .wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
+fn render_help(frame: &mut Frame<'_>, app: &App) {
     let area = centered_rect(74, 72, frame.area());
     frame.render_widget(Clear, area);
+    let focused_delete = match app.scan_mode {
+        ScanMode::Targets => "d           Delete focused row immediately",
+        ScanMode::Contents => "d           Delete focused item with confirmation",
+    };
+    let selected_delete = match app.scan_mode {
+        ScanMode::Targets => "D           Delete selected rows immediately",
+        ScanMode::Contents => "D           Delete selected items with confirmation",
+    };
     let lines = [
         "↑ ↓ / j k   Move cursor",
         "g / G       Jump to top / bottom",
@@ -1527,8 +1835,8 @@ fn render_help(frame: &mut Frame<'_>) {
         "i           Invert filtered selection",
         "/           Search",
         "s           Sort",
-        "d           Delete focused row immediately",
-        "D           Delete selected rows immediately",
+        focused_delete,
+        selected_delete,
         "r           Rescan when idle",
         "?           Toggle help",
         "q / ctrl-c  Quit",
@@ -1542,6 +1850,14 @@ fn render_help(frame: &mut Frame<'_>) {
             .style(Style::default().fg(TEXT_PRIMARY).bg(SURFACE)),
         area,
     );
+}
+
+fn key_label(key: char) -> &'static str {
+    match key {
+        'd' => "d",
+        'D' => "D",
+        _ => "?",
+    }
 }
 
 fn footer_spans(pairs: &[(&str, &str, bool)]) -> Vec<Span<'static>> {
@@ -1710,22 +2026,27 @@ fn display_relative_path(root: &Path, path: &Path) -> String {
         .unwrap_or_else(|_| path.display().to_string())
 }
 
-fn compact_relative_path(path: &str) -> String {
+fn compact_relative_path(path: &str, scan_mode: ScanMode) -> String {
     const MAX_CHARS: usize = 28;
     if path.chars().count() <= MAX_CHARS {
         return path.to_string();
     }
 
-    let trimmed = path.trim_start_matches("./").trim_end_matches("/target");
-    let tail = trimmed
-        .rsplit('/')
-        .take(2)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<Vec<_>>()
-        .join("/");
-    format!("…/{tail}/target")
+    match scan_mode {
+        ScanMode::Targets => {
+            let trimmed = path.trim_start_matches("./").trim_end_matches("/target");
+            let tail = trimmed
+                .rsplit('/')
+                .take(2)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("/");
+            format!("…/{tail}/target")
+        }
+        ScanMode::Contents => truncate_middle_text(path, MAX_CHARS),
+    }
 }
 
 fn format_size_cell(bytes: u64) -> String {
@@ -1791,6 +2112,26 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
     #[test]
+    fn cli_defaults_to_targets_and_accepts_explicit_contents_mode() {
+        let temp = TestDir::new();
+
+        let default_mode =
+            parse_arguments_from([temp.path().as_os_str().to_owned()].into_iter()).unwrap();
+        let contents_mode = parse_arguments_from(
+            [
+                OsString::from("contents"),
+                temp.path().as_os_str().to_owned(),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+
+        assert_eq!(default_mode.scan_mode, ScanMode::Targets);
+        assert_eq!(contents_mode.scan_mode, ScanMode::Contents);
+        assert_eq!(default_mode.root, contents_mode.root);
+    }
+
+    #[test]
     fn scan_finds_recursive_cargo_backed_targets_only() {
         let temp = TestDir::new();
         create_project(&temp.path().join("alpha"), 1024);
@@ -1808,6 +2149,37 @@ mod tests {
                 .iter()
                 .all(|entry| entry.relative_path.contains("target"))
         );
+    }
+
+    #[test]
+    fn contents_mode_measures_only_direct_children_including_files() {
+        let temp = TestDir::new();
+        let cache = temp.path().join("cache");
+        fs::create_dir_all(cache.join("nested")).unwrap();
+        fs::write(cache.join("artifact.bin"), vec![0_u8; 1024]).unwrap();
+        fs::write(cache.join("nested/second.bin"), vec![0_u8; 2048]).unwrap();
+        fs::write(temp.path().join("archive.tar"), vec![0_u8; 512]).unwrap();
+
+        let entries = scan_contents_sync(temp.path());
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries
+                .iter()
+                .find(|entry| entry.display_name == "cache")
+                .unwrap()
+                .size_bytes,
+            3072
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .find(|entry| entry.display_name == "archive.tar")
+                .unwrap()
+                .size_bytes,
+            512
+        );
+        assert!(!entries.iter().any(|entry| entry.display_name == "nested"));
     }
 
     #[test]
@@ -1865,7 +2237,7 @@ mod tests {
     fn filtering_and_selection_stay_scoped_to_visible_rows() {
         let temp = TestDir::new();
         let (tx, rx) = mpsc::channel();
-        let mut app = App::new(temp.path().to_path_buf(), tx, rx);
+        let mut app = App::new(temp.path().to_path_buf(), ScanMode::Targets, tx, rx);
         app.entries = vec![
             fake_entry("alpha", 10),
             fake_entry("beta", 20),
@@ -1886,6 +2258,30 @@ mod tests {
     }
 
     #[test]
+    fn selecting_with_space_advances_to_the_next_visible_row() {
+        let temp = TestDir::new();
+        let (tx, rx) = mpsc::channel();
+        let mut app = App::new(temp.path().to_path_buf(), ScanMode::Targets, tx, rx);
+        app.entries = vec![
+            fake_entry("alpha", 10),
+            fake_entry("beta", 20),
+            fake_entry("gamma", 30),
+        ];
+        app.recompute_view();
+
+        app.handle_browsing_key(KeyEvent::from(KeyCode::Char(' ')));
+
+        assert!(app.selected.contains(&PathBuf::from("/tmp/gamma/target")));
+        assert_eq!(app.current_entry().unwrap().display_name, "beta");
+
+        app.set_cursor(app.filtered_indices.len() - 1);
+        app.handle_browsing_key(KeyEvent::from(KeyCode::Char(' ')));
+
+        assert!(app.selected.contains(&PathBuf::from("/tmp/alpha/target")));
+        assert_eq!(app.current_entry().unwrap().display_name, "alpha");
+    }
+
+    #[test]
     fn deleting_focused_target_removes_only_that_directory_without_rescanning() {
         let temp = TestDir::new();
         let project = temp.path().join("alpha");
@@ -1898,14 +2294,14 @@ mod tests {
         ];
 
         let (tx, rx) = mpsc::channel();
-        let mut app = App::new(temp.path().to_path_buf(), tx, rx);
+        let mut app = App::new(temp.path().to_path_buf(), ScanMode::Targets, tx, rx);
         app.entries = entries;
         app.scan_summary.found = app.entries.len();
         app.scan_summary.measured = app.entries.len();
         app.scan_summary.total_bytes = app.cached_total_bytes();
         app.recompute_view();
         app.selected.insert(app.entries[1].target_path.clone());
-        app.start_delete_current();
+        app.request_delete_current();
         wait_for_delete(&mut app);
 
         assert!(!project.join("target").exists());
@@ -1931,13 +2327,13 @@ mod tests {
         fs::remove_dir_all(project.join("target")).unwrap();
 
         let (tx, rx) = mpsc::channel();
-        let mut app = App::new(temp.path().to_path_buf(), tx, rx);
+        let mut app = App::new(temp.path().to_path_buf(), ScanMode::Targets, tx, rx);
         app.entries = vec![entry];
         app.scan_summary.found = 1;
         app.scan_summary.measured = 1;
         app.scan_summary.total_bytes = app.cached_total_bytes();
         app.recompute_view();
-        app.start_delete_current();
+        app.request_delete_current();
         wait_for_delete(&mut app);
         assert!(matches!(
             app.entries[0].delete_status,
@@ -1946,7 +2342,7 @@ mod tests {
         assert_eq!(app.scan_summary.total_bytes, 512);
 
         create_project(&project, 512);
-        app.start_delete_current();
+        app.request_delete_current();
         wait_for_delete(&mut app);
         assert!(matches!(
             app.entries[0].delete_status,
@@ -1956,10 +2352,57 @@ mod tests {
     }
 
     #[test]
+    fn contents_delete_requires_confirmation_and_cannot_delete_viewed_root() {
+        let temp = TestDir::new();
+        let cache = temp.path().join("cache");
+        fs::create_dir_all(&cache).unwrap();
+        fs::write(cache.join("artifact.bin"), vec![0_u8; 512]).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let mut app = App::new(temp.path().to_path_buf(), ScanMode::Contents, tx, rx);
+        app.entries = scan_contents_sync(temp.path());
+        app.recompute_view();
+
+        app.request_delete_current();
+
+        assert!(cache.exists());
+        assert!(matches!(app.mode, AppMode::ConfirmDelete { key: 'd', .. }));
+        app.handle_key(KeyEvent::from(KeyCode::Char('d')));
+        wait_for_delete(&mut app);
+
+        assert!(!cache.exists());
+        assert!(validate_delete_path(ScanMode::Contents, temp.path(), temp.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn contents_delete_removes_symlink_without_following_destination() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TestDir::new();
+        let viewed = temp.path().join("viewed");
+        let destination = temp.path().join("destination");
+        fs::create_dir_all(&viewed).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(destination.join("keep.bin"), vec![0_u8; 512]).unwrap();
+        symlink(&destination, viewed.join("link")).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let mut app = App::new(viewed.clone(), ScanMode::Contents, tx, rx);
+        app.entries = scan_contents_sync(&viewed);
+        app.recompute_view();
+
+        app.request_delete_current();
+        app.handle_key(KeyEvent::from(KeyCode::Char('d')));
+        wait_for_delete(&mut app);
+
+        assert!(!viewed.join("link").exists());
+        assert!(destination.join("keep.bin").exists());
+    }
+
+    #[test]
     fn render_empty_and_inline_delete_states() {
         let temp = TestDir::new();
         let (tx, rx) = mpsc::channel();
-        let mut app = App::new(temp.path().to_path_buf(), tx, rx);
+        let mut app = App::new(temp.path().to_path_buf(), ScanMode::Targets, tx, rx);
         app.mode = AppMode::Browsing;
 
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
@@ -2051,7 +2494,7 @@ mod tests {
         create_project(&project, 1024);
         let entry = measure_target(&project, &project.join("target"), temp.path()).unwrap();
         let (tx, rx) = mpsc::channel();
-        let mut app = App::new(temp.path().to_path_buf(), tx, rx);
+        let mut app = App::new(temp.path().to_path_buf(), ScanMode::Targets, tx, rx);
         app.scan_in_progress = true;
         app.worker_tx
             .send(WorkerMessage::ScanMeasured {
@@ -2063,7 +2506,7 @@ mod tests {
 
         app.drain_worker_messages();
         app.toggle_current_selection();
-        app.start_delete_current();
+        app.request_delete_current();
         wait_for_delete(&mut app);
 
         assert!(matches!(
@@ -2076,7 +2519,7 @@ mod tests {
     fn scan_updates_preserve_focused_target_after_resort() {
         let temp = TestDir::new();
         let (tx, rx) = mpsc::channel();
-        let mut app = App::new(temp.path().to_path_buf(), tx, rx);
+        let mut app = App::new(temp.path().to_path_buf(), ScanMode::Targets, tx, rx);
         app.entries = vec![fake_entry("alpha", 10), fake_entry("beta", 20)];
         app.recompute_view();
         app.cursor = 1;
@@ -2098,7 +2541,7 @@ mod tests {
     fn scan_completion_focuses_largest_row_without_user_navigation() {
         let temp = TestDir::new();
         let (tx, rx) = mpsc::channel();
-        let mut app = App::new(temp.path().to_path_buf(), tx, rx);
+        let mut app = App::new(temp.path().to_path_buf(), ScanMode::Targets, tx, rx);
         app.scan_in_progress = true;
         app.worker_tx
             .send(WorkerMessage::ScanMeasured {
@@ -2132,7 +2575,7 @@ mod tests {
     fn scan_completion_preserves_user_navigation() {
         let temp = TestDir::new();
         let (tx, rx) = mpsc::channel();
-        let mut app = App::new(temp.path().to_path_buf(), tx, rx);
+        let mut app = App::new(temp.path().to_path_buf(), ScanMode::Targets, tx, rx);
         app.scan_in_progress = true;
         for (measured, entry) in [
             (1, fake_entry("alpha", 10)),
@@ -2167,7 +2610,7 @@ mod tests {
     fn rescan_is_ignored_while_scan_is_busy() {
         let temp = TestDir::new();
         let (tx, rx) = mpsc::channel();
-        let mut app = App::new(temp.path().to_path_buf(), tx, rx);
+        let mut app = App::new(temp.path().to_path_buf(), ScanMode::Targets, tx, rx);
         app.entries = vec![fake_entry("alpha", 10)];
         app.recompute_view();
         app.scan_in_progress = true;
@@ -2190,7 +2633,12 @@ mod tests {
             measure_target(&beta, &beta.join("target"), temp.path()).unwrap(),
         ];
         let (worker_tx, worker_rx) = mpsc::channel();
-        let mut app = App::new(temp.path().to_path_buf(), worker_tx, worker_rx);
+        let mut app = App::new(
+            temp.path().to_path_buf(),
+            ScanMode::Targets,
+            worker_tx,
+            worker_rx,
+        );
         app.entries = entries;
         app.recompute_view();
         app.delete_worker_limit = 1;
@@ -2210,7 +2658,7 @@ mod tests {
             app.selected.insert(entry.target_path.clone());
         }
 
-        app.start_delete_selected();
+        app.request_delete_selected();
 
         started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(
@@ -2244,6 +2692,17 @@ mod tests {
     fn scan_sync(root: &Path) -> Vec<TargetEntry> {
         let (tx, rx) = mpsc::channel();
         scan_targets(root.to_path_buf(), tx, 2);
+        rx.try_iter()
+            .filter_map(|message| match message {
+                WorkerMessage::ScanMeasured { entry, .. } => Some(entry),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn scan_contents_sync(root: &Path) -> Vec<TargetEntry> {
+        let (tx, rx) = mpsc::channel();
+        scan_contents(root.to_path_buf(), tx, 2);
         rx.try_iter()
             .filter_map(|message| match message {
                 WorkerMessage::ScanMeasured { entry, .. } => Some(entry),
