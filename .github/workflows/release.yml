@@ -112,18 +112,15 @@ jobs:
         run: |
           set -euo pipefail
 
-          status=$(curl -sS -o /tmp/purgee-version.json -w '%{http_code}' "https://crates.io/api/v1/crates/purgee/${VERSION}")
-          case "$status" in
-            200)
-              echo "purgee ${VERSION} is already published; skipping."
-              exit 0
-              ;;
-            404)
-              cargo publish --token "$CARGO_REGISTRY_TOKEN"
-              ;;
-            *)
-              echo "Unexpected crates.io response for purgee ${VERSION}: HTTP ${status}" >&2
-              cat /tmp/purgee-version.json >&2 || true
-              exit 1
-              ;;
-          esac
+          if curl -fsSL https://index.crates.io/pu/rg/purgee \
+            | python3 -c 'import json, os, sys; version = os.environ["VERSION"]; sys.exit(0 if any(json.loads(line)["vers"] == version for line in sys.stdin if line.strip()) else 1)'; then
+            echo "purgee ${VERSION} is already published; skipping."
+            exit 0
+          fi
+
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "CARGO_REGISTRY_TOKEN is required to publish purgee ${VERSION}." >&2
+            exit 1
+          fi
+
+          cargo publish --token "$CARGO_REGISTRY_TOKEN"
